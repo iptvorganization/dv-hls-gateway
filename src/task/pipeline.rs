@@ -427,6 +427,7 @@ async fn run_inner(
                     surl,
                     video_dur_ts: v.duration_ts,
                     audio_dur_ts,
+                    skip_to_on_failure: is_live.then(|| v.number.saturating_add(1)),
                 });
             }
         }
@@ -435,9 +436,10 @@ async fn run_inner(
             audio_wait_refreshes = 0;
         }
 
+        let mut skipped_live_gap = false;
         if !new_jobs.is_empty() {
             let batch_last = new_jobs.last().map(|j| j.num).unwrap_or(next_number);
-            let (av, aa, processed_until) = process_batch(
+            let progress = process_batch(
                 task,
                 dl,
                 &vdec,
@@ -461,12 +463,32 @@ async fn run_inner(
                 audio_required,
             )
             .await?;
-            acc_v_dts = av;
-            acc_a_dts = aa;
+            acc_v_dts = progress.acc_v_dts;
+            acc_a_dts = progress.acc_a_dts;
             // next_number 用「实际处理到的位置」，而非批前预算值。
             // 被取消时 process_batch 提前返回，processed_until 只到已完成的段，
             // 避免把 resume_number 错误地跳到批末尾（否则恢复时无段可处理→误判完成）。
-            next_number = processed_until;
+            next_number = progress.next_number;
+            if let Some(skip) = progress.skipped_failure {
+                tracing::warn!(
+                    task = %task.id,
+                    failed_seg = skip.failed_num,
+                    skip_to = skip.skip_to,
+                    "live MPD segment failed; skipping stale head range to stay near live edge"
+                );
+                drop_mpd_live_gap_boundary(
+                    task,
+                    video.timescale,
+                    &mut agg_vaus,
+                    &mut agg_aaus,
+                    &mut agg_dur_ts,
+                    &mut agg_audio_dur_ts,
+                    &mut subtitle_acc,
+                    &mut pending_discontinuity,
+                );
+                last_v_tfdt = None;
+                skipped_live_gap = true;
+            }
             let _ = batch_last;
             // 持久化进度到 task，供停止/暂停后重启续传
             task.resume_number.store(next_number, O::Relaxed);
@@ -476,6 +498,10 @@ async fn run_inner(
 
         if !is_live {
             break; // VOD 处理完即结束
+        }
+
+        if skipped_live_gap && video.segments.iter().any(|s| s.number >= next_number) {
+            continue;
         }
 
         // live：等待约一个段时长后重拉 MPD 取增量
@@ -642,7 +668,7 @@ async fn process_batch(
     pending_discontinuity: &mut bool,
     last_v_tfdt: &mut Option<u64>,
     audio_required: bool,
-) -> crate::Result<(u64, u64, u64)> {
+) -> crate::Result<BatchProgress> {
     // 记录批内首段号，用于在未处理任何段时返回正确的 next 位置
     let batch_first = jobs.first().map(|j| j.num).unwrap_or(0);
     // 实际处理到的「下一个待处理段号」（被取消时只到已完成处）
@@ -650,6 +676,10 @@ async fn process_batch(
     // 下载层允许乱序完成，处理层用 job_order + pending map 恢复原段序。
     // 这样早期慢段不会阻止后续分片继续下载，但 DTS/PTS 和 mux 仍严格顺序推进。
     let job_order: Vec<u64> = jobs.iter().map(|j| j.num).collect();
+    let failure_skip_by_num: BTreeMap<u64, u64> = jobs
+        .iter()
+        .filter_map(|j| j.skip_to_on_failure.map(|skip_to| (j.num, skip_to)))
+        .collect();
     let dl2 = dl.clone();
     let task2 = task.clone();
     let fetch_concurrency = task.segment_fetch_concurrency();
@@ -664,6 +694,7 @@ async fn process_batch(
                 surl,
                 video_dur_ts,
                 audio_dur_ts,
+                skip_to_on_failure: _,
             } = job;
             let dl_video = dl.clone();
             let dl_audio = dl.clone();
@@ -762,7 +793,30 @@ async fn process_batch(
 
         while let Some(expected_num) = job_order.get(next_job_index).copied() {
             if failed.contains(&expected_num) {
-                return Ok((acc_v_dts, acc_a_dts, next_processed));
+                let skipped_failure =
+                    failure_skip_by_num
+                        .get(&expected_num)
+                        .copied()
+                        .and_then(|skip_to| {
+                            (skip_to > next_processed).then_some(SkippedFailure {
+                                failed_num: expected_num,
+                                skip_to,
+                            })
+                        });
+                if let Some(skip) = skipped_failure {
+                    return Ok(BatchProgress {
+                        acc_v_dts,
+                        acc_a_dts,
+                        next_number: skip.skip_to,
+                        skipped_failure: Some(skip),
+                    });
+                }
+                return Ok(BatchProgress {
+                    acc_v_dts,
+                    acc_a_dts,
+                    next_number: next_processed,
+                    skipped_failure: None,
+                });
             }
             let Some(segment) = pending.remove(&expected_num) else {
                 break;
@@ -802,7 +856,25 @@ async fn process_batch(
         }
     }
 
-    Ok((acc_v_dts, acc_a_dts, next_processed))
+    Ok(BatchProgress {
+        acc_v_dts,
+        acc_a_dts,
+        next_number: next_processed,
+        skipped_failure: None,
+    })
+}
+
+struct BatchProgress {
+    acc_v_dts: u64,
+    acc_a_dts: u64,
+    next_number: u64,
+    skipped_failure: Option<SkippedFailure>,
+}
+
+#[derive(Clone, Copy)]
+struct SkippedFailure {
+    failed_num: u64,
+    skip_to: u64,
 }
 
 struct SegmentJob {
@@ -812,6 +884,7 @@ struct SegmentJob {
     surl: Option<String>,
     video_dur_ts: u64,
     audio_dur_ts: Option<u64>,
+    skip_to_on_failure: Option<u64>,
 }
 
 struct SegmentFetchFailure {
@@ -914,6 +987,10 @@ fn build_short_source_live_jobs(
             None
         };
 
+        let skip_to_on_failure = group
+            .last()
+            .map(|seg| seg.number.saturating_add(1))
+            .unwrap_or(next_number);
         for (pos, v) in group.iter().enumerate() {
             let audio_match = audio_matches
                 .as_ref()
@@ -929,6 +1006,7 @@ fn build_short_source_live_jobs(
                 surl: subtitle_match.as_ref().map(|(url, _)| url.clone()),
                 video_dur_ts: v.duration_ts,
                 audio_dur_ts: audio_match.map(|(_, dur)| dur),
+                skip_to_on_failure: Some(skip_to_on_failure),
             });
         }
     }
@@ -1826,6 +1904,34 @@ fn mark_mpd_epoch_boundary(
     task.origin_a_tfdt.store(u64::MAX, Ordering::Relaxed);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn drop_mpd_live_gap_boundary(
+    task: &Arc<Task>,
+    video_timescale: u32,
+    acc_vaus: &mut Vec<AccessUnit>,
+    acc_aaus: &mut Vec<AudioUnit>,
+    acc_dur_ts: &mut u64,
+    agg_audio_dur_ts: &mut u64,
+    subtitle_acc: &mut SubtitleAccumulator,
+    pending_discontinuity: &mut bool,
+) {
+    if !acc_vaus.is_empty() {
+        tracing::warn!(
+            task = %task.id,
+            dropped_ms = aggregate_duration_ms(*acc_dur_ts, video_timescale),
+            "dropping partial live aggregate before resyncing to newer MPD range"
+        );
+        acc_vaus.clear();
+        acc_aaus.clear();
+        subtitle_acc.clear();
+        *acc_dur_ts = 0;
+        *agg_audio_dur_ts = 0;
+    }
+    *pending_discontinuity = true;
+    task.origin_v_tfdt.store(u64::MAX, Ordering::Relaxed);
+    task.origin_a_tfdt.store(u64::MAX, Ordering::Relaxed);
+}
+
 fn mpd_tfdt_rewound(last: Option<u64>, current: Option<u64>) -> bool {
     matches!((last, current), (Some(prev), Some(now)) if now < prev)
 }
@@ -2018,6 +2124,10 @@ mod tests {
             plan.jobs.iter().map(|j| j.num).collect::<Vec<_>>(),
             vec![0, dur, dur * 2, dur * 3]
         );
+        assert!(plan
+            .jobs
+            .iter()
+            .all(|j| j.skip_to_on_failure == Some(dur * 3 + 1)));
         assert!(plan.blocked_on_audio.is_none());
         assert!(!plan.skipped_incomplete_head);
     }
@@ -2052,6 +2162,10 @@ mod tests {
             plan.jobs.iter().map(|j| j.num).collect::<Vec<_>>(),
             vec![dur * 4, dur * 5, dur * 6, dur * 7]
         );
+        assert!(plan
+            .jobs
+            .iter()
+            .all(|j| j.skip_to_on_failure == Some(dur * 7 + 1)));
         assert!(plan.skipped_incomplete_head);
         assert!(plan.blocked_on_audio.is_none());
     }
