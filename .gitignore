@@ -1,0 +1,46 @@
+# Rust build output
+/target/
+
+# Runtime/local configuration. Keep the committed example instead.
+/dv-hls-gateway.json
+/dv-hls-gateway.local.json
+*.local.json
+
+# Local reverse-engineering and playback artifacts
+/artifacts/
+/nm3u8_work/
+*.log
+*.mpd
+*.m3u8
+*.ts
+*.mp4
+*.m4s
+*.cmfv
+*.cmfa
+*.cmft
+*.jpeg
+*.jpg
+*.vtt
+
+# macOS local filesystem metadata/cache
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100/
+.Spotlight-V100/
+.TemporaryItems/
+.Trashes/
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Icon?
+
+# Editor/agent local state
+/.claude/
+.idea/
+.vscode/
+
+# Local binaries
+/dv-hls-gateway
+/dv-hls-gateway-*

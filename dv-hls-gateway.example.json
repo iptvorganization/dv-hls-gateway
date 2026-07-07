@@ -1,0 +1,16 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 37201
+  },
+  "auth": {
+    "key": "change-me"
+  },
+  "key_api": {
+    "url": "",
+    "token": "",
+    "attempts": 12,
+    "retry_base_ms": 400,
+    "retry_max_ms": 8000
+  }
+}

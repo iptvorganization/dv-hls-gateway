@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DV-HLS Gateway</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --acc:#e8830c; --txt:#d4d8de; --mut:#7d8590; --ok:#3fb950; --err:#f85149; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:14px 20px; background:var(--panel); border-bottom:1px solid #232a33; }
+  header h1 { margin:0; font-size:17px; }
+  header h1 span { color:var(--acc); }
+  .wrap { max-width:1100px; margin:0 auto; padding:20px; }
+  .card { background:var(--panel); border:1px solid #232a33; border-radius:10px; padding:16px; margin-bottom:18px; }
+  label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
+  input, select, textarea { width:100%; padding:8px 10px; background:#0e1116; border:1px solid #2d343d; border-radius:6px; color:var(--txt); font-size:13px; }
+  .row { display:flex; gap:12px; } .row>div { flex:1; }
+  button { background:var(--acc); color:#1a1205; border:none; padding:9px 16px; border-radius:6px; font-weight:600; cursor:pointer; font-size:13px; }
+  button:hover { filter:brightness(1.1); } button:disabled { opacity:.5; cursor:not-allowed; }
+  button.ghost { background:transparent; border:1px solid #2d343d; color:var(--txt); }
+  button.danger { background:transparent; border:1px solid var(--err); color:var(--err); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 6px; border-bottom:1px solid #232a33; }
+  th { color:var(--mut); font-weight:500; font-size:11px; text-transform:uppercase; }
+  .badge { padding:2px 8px; border-radius:10px; font-size:11px; }
+  .s-running{background:rgba(63,185,80,.15);color:var(--ok);} .s-error{background:rgba(248,81,73,.15);color:var(--err);}
+  .s-stopped,.s-finished{background:rgba(125,133,144,.15);color:var(--mut);} .s-parsing{background:rgba(232,131,12,.15);color:var(--acc);}
+  .s-paused{background:rgba(88,166,255,.15);color:#58a6ff;}
+  .muted { color:var(--mut); font-size:12px; }
+  video { width:100%; border-radius:8px; background:#000; margin-top:10px; }
+  .hide { display:none; }
+  .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .tracks { max-height:200px; overflow:auto; border:1px solid #2d343d; border-radius:6px; margin-top:4px; }
+  .tracks div { padding:6px 10px; cursor:pointer; border-bottom:1px solid #232a33; }
+  .tracks div:hover { background:#1d232b; } .tracks div.sel { background:rgba(232,131,12,.18); }
+  .inline-control { display:flex; align-items:center; gap:8px; margin-top:10px; color:var(--txt); }
+  .inline-control input { width:auto; }
+  .field-note { color:var(--mut); font-size:12px; margin-top:4px; }
+  .table-wrap { width:100%; overflow-x:auto; }
+  .task-actions { display:flex; flex-wrap:wrap; gap:6px; }
+  .gold-badge {
+    display:inline-flex; align-items:center; justify-content:center;
+    font-size:13px; font-weight:700; white-space:nowrap;
+    padding:6px 14px; border-radius:20px;
+    color:#3a2a00;
+    background:linear-gradient(135deg,#fff3b0 0%,#f5c518 35%,#d4a017 60%,#f5d76e 100%);
+    border:1px solid #b8860b;
+    box-shadow:0 0 10px rgba(245,197,24,.45), inset 0 1px 1px rgba(255,255,255,.6);
+    text-shadow:0 1px 0 rgba(255,255,255,.4);
+    text-decoration:none;
+  }
+  .footer-brand { display:flex; justify-content:center; padding:2px 20px 24px; }
+  @media (max-width: 760px) {
+    body { font-size:13px; }
+    header { padding:12px 14px; }
+    header h1 { font-size:15px; line-height:1.35; }
+    .wrap { padding:12px; }
+    .card { padding:12px; margin-bottom:12px; border-radius:8px; }
+    .row { flex-direction:column; gap:8px; }
+    button { width:100%; padding:10px 12px; }
+    button.ghost, button.danger { width:auto; }
+    .tracks { max-height:260px; }
+    table, thead, tbody, tr, td { display:block; width:100%; }
+    table { min-width:0; }
+    thead { display:none; }
+    tr { padding:10px 0; border-bottom:1px solid #2d343d; }
+    tr:last-child { border-bottom:none; }
+    td { display:grid; grid-template-columns:82px minmax(0,1fr); gap:8px; border-bottom:none; padding:6px 0; align-items:start; }
+    td::before { content:attr(data-label); color:var(--mut); font-size:11px; text-transform:uppercase; }
+    td.action-cell { display:block; }
+    td.action-cell::before { display:block; margin-bottom:6px; }
+    .task-actions { gap:8px; }
+    .task-actions button { flex:1 1 calc(50% - 8px); }
+    #detailBody > div[style*="display:flex"] { flex-direction:column; align-items:stretch !important; }
+    .gold-badge { white-space:normal; text-align:center; line-height:1.35; }
+    .footer-brand { padding:0 12px 18px; }
+  }
+</style>
+</head>
+<body>
+<div id="loginMask" style="position:fixed;inset:0;background:#0e1116;z-index:999;display:flex;align-items:center;justify-content:center">
+  <div class="card" style="width:360px;text-align:center">
+    <h3 style="margin-top:0">🔒 访问鉴权</h3>
+    <div class="muted" style="margin-bottom:10px">请输入访问密钥</div>
+    <input id="loginKey" type="password" placeholder="密钥" style="text-align:center" onkeydown="if(event.key==='Enter')doLogin()">
+    <div id="loginErr" style="color:var(--err);font-size:12px;height:16px;margin:6px 0"></div>
+    <button onclick="doLogin()" style="width:100%">进 入</button>
+  </div>
+</div>
+<header>
+  <h1>DV-HLS <span>Gateway</span> — MPD / M3U8 → 实时 HLS-TS</h1>
+</header>
+<div class="wrap">
+
+  <div class="card">
+    <h3 style="margin-top:0">新建任务</h3>
+    <label>任务名称</label>
+    <input id="taskName" placeholder="例如：Apple F1 Live / Movetv 2152 / TSN 主路">
+    <label>MPD / M3U8 URL</label>
+    <input id="mpd" placeholder="https://.../master.mpd 或 index.m3u8">
+    <label class="inline-control">
+      <input id="onDemandMode" type="checkbox">
+      <span>按需启停（5分钟空闲暂停）</span>
+    </label>
+	    <label class="inline-control">
+	      <input id="dynamicKey" type="checkbox" onchange="toggleKeyMode()">
+	      <span>动态取 Key</span>
+	    </label>
+	    <label class="inline-control">
+	      <input id="subtitleMode" type="checkbox" onchange="toggleSubtitleMode()">
+	      <span>推流字幕</span>
+	    </label>
+    <label id="keysLabel">KEYS（每行一个 KID:KEY，按 KID 自动匹配视频/音频轨道）</label>
+    <textarea id="keys" class="mono" rows="3" placeholder="00112233...:ffeeddcc...&#10;11223344...:00ffeedd..." style="width:100%;padding:8px 10px;background:#0e1116;border:1px solid #2d343d;border-radius:6px;color:var(--txt);font-size:13px;resize:vertical"></textarea>
+    <div style="margin-top:12px"><button id="parseBtn" onclick="doParse()">解析轨道</button></div>
+
+    <div id="trackArea" class="hide" style="margin-top:14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <b id="trackHdr" style="cursor:pointer;user-select:none" onclick="toggleTracks()">▼ 选择轨道</b>
+        <button class="ghost" onclick="closeTracks()">✕ 关闭</button>
+      </div>
+      <div id="trackInner">
+        <div class="row">
+          <div>
+            <label>视频轨道（按码率排序）</label>
+            <div id="vtracks" class="tracks"></div>
+          </div>
+	          <div>
+	            <label>音频轨道（可不选）</label>
+	            <div id="atracks" class="tracks"></div>
+	          </div>
+	        </div>
+	        <div id="subtitleTrackWrap" class="hide" style="margin-top:10px">
+	          <label>字幕轨道</label>
+	          <div id="stracks" class="tracks"></div>
+	        </div>
+        <div class="row" style="margin-top:10px">
+          <div><label>Live 窗口段数</label><input id="window" type="number" value="6"></div>
+          <div><label>目标段时长(s)</label><input id="tdur" type="number" value="7"></div>
+        </div>
+        <div style="margin-top:12px"><button onclick="doCreate()">▶ 启动转封装</button></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0">任务列表 <span class="muted">(每 1s 刷新)</span></h3>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>任务名</th><th>状态</th><th>阶段</th><th>分辨率</th><th>CODECS</th><th>进度</th><th>m3u8</th><th>操作</th></tr></thead>
+      <tbody id="taskBody"></tbody>
+    </table>
+    </div>
+  </div>
+
+  <div id="detailCard" class="card hide">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">任务详情 <span id="detailTitle" class="muted"></span></h3>
+      <button class="ghost" onclick="closeDetail()">✕ 关闭</button>
+    </div>
+    <div id="detailBody" class="mono" style="line-height:1.8"></div>
+  </div>
+
+</div>
+<footer class="footer-brand">
+  <a class="gold-badge" href="https://t.me/iptvofficalgroup" target="_blank" rel="noopener noreferrer">★ 本项目由新加坡IPTV运营团队独家技术支持</a>
+</footer>
+
+<script>
+let parsed = null, selV = null, selA = null, selS = null;
+let selectedTaskId = null;
+let AUTH = localStorage.getItem('dvhls_key') || '';
+let refreshTimer = null;
+
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[ch]));
+}
+
+function runModeText(mode) {
+  return mode === 'on_demand' ? '按需启停' : '持续转化';
+}
+
+// 带鉴权头的 fetch 封装；401 时登出回登录页
+async function apiFetch(url, opts={}) {
+  opts.headers = Object.assign({}, opts.headers, { 'X-Auth-Key': AUTH });
+  const r = await fetch(url, opts);
+  if (r.status === 401) { logout(); throw new Error('鉴权失败'); }
+  return r;
+}
+
+async function doLogin() {
+  const k = document.getElementById('loginKey').value.trim();
+  if (!k) return;
+  // 用一次 API 校验密钥
+  try {
+    const r = await fetch('/api/tasks', { headers: { 'X-Auth-Key': k } });
+    if (r.status === 401) { document.getElementById('loginErr').textContent = '密钥错误'; return; }
+    AUTH = k;
+    localStorage.setItem('dvhls_key', k);
+    enterApp();
+  } catch(e) { document.getElementById('loginErr').textContent = '连接失败: '+e.message; }
+}
+
+function logout() {
+  AUTH = '';
+  localStorage.removeItem('dvhls_key');
+  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+  document.getElementById('loginMask').style.display = 'flex';
+}
+
+function enterApp() {
+  document.getElementById('loginMask').style.display = 'none';
+  refresh();
+  if (!refreshTimer) refreshTimer = setInterval(refresh, 1000);
+}
+
+async function doParse() {
+  const mpd = document.getElementById('mpd').value.trim();
+  if (!mpd) return alert('请输入 MPD / M3U8 URL');
+  const btn = document.getElementById('parseBtn'); btn.disabled = true; btn.textContent = '解析中…';
+  try {
+    const r = await apiFetch('/api/parse', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mpd})});
+    if (!r.ok) throw new Error(await r.text());
+    parsed = await r.json();
+    renderTracks();
+    document.getElementById('trackArea').classList.remove('hide');
+    document.getElementById('trackInner').classList.remove('hide');
+    document.getElementById('trackHdr').textContent = '▼ 选择轨道';
+  } catch(e) { alert('解析失败: '+e.message); }
+  btn.disabled = false; btn.textContent = '解析轨道';
+}
+
+function toggleTracks() {
+  const inner = document.getElementById('trackInner');
+  const hdr = document.getElementById('trackHdr');
+  const collapsed = inner.classList.toggle('hide');
+  hdr.textContent = (collapsed ? '▶ ' : '▼ ') + '选择轨道';
+}
+function closeTracks() {
+  document.getElementById('trackArea').classList.add('hide');
+}
+
+function toggleKeyMode() {
+  const dynamic = document.getElementById('dynamicKey').checked;
+  const keys = document.getElementById('keys');
+  const label = document.getElementById('keysLabel');
+  keys.disabled = dynamic;
+  keys.placeholder = dynamic
+    ? '动态模式：自动解析 KID 并请求本地取 key 接口'
+    : '00112233...:ffeeddcc...\n11223344...:00ffeedd...';
+  label.textContent = dynamic
+    ? 'KEYS（动态模式无需填写）'
+    : 'KEYS（每行一个 KID:KEY，按 KID 自动匹配视频/音频轨道）';
+}
+
+function toggleSubtitleMode() {
+  const enabled = document.getElementById('subtitleMode').checked;
+  const wrap = document.getElementById('subtitleTrackWrap');
+  if (enabled) wrap.classList.remove('hide');
+  else wrap.classList.add('hide');
+}
+
+function renderTracks() {
+  const vt = document.getElementById('vtracks'), at = document.getElementById('atracks'), st = document.getElementById('stracks');
+  vt.innerHTML = ''; at.innerHTML = ''; st.innerHTML = ''; selV = null; selA = null; selS = null;
+  parsed.video.forEach((t,i) => {
+    const d = document.createElement('div');
+    d.innerHTML = `<b>${t.resolution||'?'}</b> · ${(t.bandwidth/1e6).toFixed(2)}Mbps · <span class="mono">${t.codecs}</span>`;
+    d.onclick = () => { selV = t.id; [...vt.children].forEach(c=>c.classList.remove('sel')); d.classList.add('sel'); };
+    if (i===0) { selV=t.id; d.classList.add('sel'); }
+    vt.appendChild(d);
+  });
+  const none = document.createElement('div');
+  none.textContent = '（不要音频）'; none.onclick = () => { selA=null; [...at.children].forEach(c=>c.classList.remove('sel')); none.classList.add('sel'); };
+  at.appendChild(none);
+  parsed.audio.forEach(t => {
+    const d = document.createElement('div');
+    const rate = t.bandwidth ? ` · ${(t.bandwidth/1e3).toFixed(0)}kbps` : '';
+    d.innerHTML = `${t.lang||'?'} · <span class="mono">${t.codecs}</span>${rate}`;
+    d.onclick = () => { selA = t.id; [...at.children].forEach(c=>c.classList.remove('sel')); d.classList.add('sel'); };
+    at.appendChild(d);
+  });
+  const noSub = document.createElement('div');
+  noSub.textContent = '（不选择字幕）';
+  noSub.onclick = () => { selS=null; [...st.children].forEach(c=>c.classList.remove('sel')); noSub.classList.add('sel'); };
+  st.appendChild(noSub);
+  (parsed.subtitles || []).forEach((t, i) => {
+    const d = document.createElement('div');
+    d.innerHTML = `${t.lang||'?'} · <span class="mono">${t.codecs||'subtitle'}</span>${t.segments ? ` · ${t.segments}段` : ''}`;
+    d.onclick = () => { selS = t.id; [...st.children].forEach(c=>c.classList.remove('sel')); d.classList.add('sel'); };
+    if (i === 0) { selS = t.id; d.classList.add('sel'); }
+    st.appendChild(d);
+  });
+  if (!(parsed.subtitles || []).length) noSub.classList.add('sel');
+  toggleSubtitleMode();
+}
+
+async function doCreate() {
+  if (!selV) return alert('请选择视频轨道');
+  const name = document.getElementById('taskName').value.trim();
+  if (!name) return alert('请输入任务名称');
+  const dynamicKey = document.getElementById('dynamicKey').checked;
+  const onDemandMode = document.getElementById('onDemandMode').checked;
+  const subtitleMode = document.getElementById('subtitleMode').checked;
+  const keys = document.getElementById('keys').value.trim();
+  if (!dynamicKey && !keys) return alert('请输入 KEYS，或开启动态取 Key');
+  if (subtitleMode && !(parsed.subtitles || []).length) return alert('当前链接没有可用字幕轨道');
+  const body = {
+    name,
+    mpd: document.getElementById('mpd').value.trim(),
+    keys,
+    key_mode: dynamicKey ? 'dynamic' : 'static',
+    run_mode: onDemandMode ? 'on_demand' : 'always',
+    video_rep_id: selV,
+    audio_rep_id: selA,
+    enable_subtitles: subtitleMode,
+    subtitle_rep_id: subtitleMode ? selS : null,
+    window: parseInt(document.getElementById('window').value)||6,
+    target_duration: parseInt(document.getElementById('tdur').value)||7,
+  };
+  try {
+    const r = await apiFetch('/api/tasks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    if (!r.ok) throw new Error(await r.text());
+    await r.json();
+    closeTracks(); // 创建后自动收起轨道选择区
+    refresh();
+  } catch(e) { alert('创建失败: '+e.message); }
+}
+
+async function refresh() {
+  try {
+    const r = await apiFetch('/api/tasks'); const tasks = await r.json();
+    const tb = document.getElementById('taskBody'); tb.innerHTML = '';
+    let detailTask = null;
+    tasks.forEach(t => {
+      if (t.id === selectedTaskId) detailTask = t;
+      // 直播进度：不显示固定总量(每轮刷新 MPD 会变)，VOD 显示 N/M(%)
+      const liveProg = t.is_dynamic
+        ? `已产 ${t.segments_done} 段`
+        : (() => { const tot = t.total_segments||0; const pct = tot ? Math.round(t.segments_done/tot*100) : 0;
+            return `${t.segments_done}/${tot} (${pct}%)`; })();
+      const modeLine = t.run_mode === 'on_demand'
+        ? `${runModeText(t.run_mode)} · 空闲 ${t.idle_secs || 0}/${t.idle_timeout_secs || 300}s`
+        : runModeText(t.run_mode);
+      const m3u8 = `${location.origin}${t.playlist_url}`;
+      const subtitleLine = t.subtitles_enabled ? ` · 字幕 ${t.subtitle_lang || t.subtitle_rep_id || 'on'}` : '';
+      // 按状态决定控制按钮：运行中→[暂停][停止]；其余→[启动]
+      const running = (t.state === 'running' || t.state === 'parsing');
+      const ctrl = running
+        ? `<button class="ghost" onclick="ctl('${t.id}','pause')">暂停</button>
+           <button class="ghost" onclick="ctl('${t.id}','stop')">停止</button>`
+        : `<button class="ghost" style="color:var(--ok);border-color:var(--ok)" onclick="ctl('${t.id}','start')">启动</button>`;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td data-label="任务名"><b>${esc(t.name || '未命名任务')}</b><div class="muted">${esc(modeLine)}${esc(subtitleLine)}</div><div class="muted mono">${esc(t.source_kind || '')}</div></td>
+        <td data-label="状态"><span class="badge s-${t.state}">${esc(t.state)}</span>${t.error?`<div class="muted" style="color:#f85149;max-width:200px">${esc(t.error)}</div>`:''}</td>
+        <td data-label="阶段">${esc(t.stage||'')}</td>
+        <td data-label="分辨率">${esc(t.resolution)}</td>
+        <td data-label="CODECS" class="mono">${esc(t.codecs)}</td>
+        <td data-label="进度">${liveProg}<div class="muted">窗口 ${t.segments_available} · ${t.mb_done.toFixed(1)}MB</div></td>
+        <td data-label="m3u8"><button class="ghost" onclick="copyM3u8('${m3u8}', this)">复制 m3u8</button></td>
+        <td data-label="操作" class="action-cell"><div class="task-actions">
+          <button class="ghost" onclick="showDetail('${t.id}')">详情</button>
+          ${ctrl}
+          <button class="danger" onclick="delTask('${t.id}')">删除</button>
+        </div></td>`;
+      tb.appendChild(tr);
+    });
+    if (selectedTaskId) renderDetail(detailTask);
+  } catch(e) {}
+}
+
+function copyM3u8(url, btn) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(() => {
+      const old = btn.textContent; btn.textContent = '✓ 已复制';
+      setTimeout(() => btn.textContent = old, 1200);
+    }, () => { fallbackCopy(url, btn); });
+  } else {
+    fallbackCopy(url, btn);
+  }
+}
+
+function fallbackCopy(url, btn) {
+  const ta = document.createElement('textarea');
+  ta.value = url;
+  ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); }
+  catch(e) { prompt('复制此 m3u8 地址：', url); }
+  document.body.removeChild(ta);
+  const old = btn.textContent; btn.textContent = '✓ 已复制';
+  setTimeout(() => btn.textContent = old, 1200);
+}
+
+function showDetail(id) {
+  // 再次点击同一任务的"详情"→ 折叠收起
+  if (selectedTaskId === id) {
+    selectedTaskId = null;
+    document.getElementById('detailCard').classList.add('hide');
+    return;
+  }
+  selectedTaskId = id;
+  document.getElementById('detailCard').classList.remove('hide');
+  refresh();
+  document.getElementById('detailCard').scrollIntoView({behavior:'smooth'});
+}
+
+function closeDetail() {
+  selectedTaskId = null;
+  document.getElementById('detailCard').classList.add('hide');
+}
+
+function renderDetail(t) {
+  const card = document.getElementById('detailCard');
+  const body = document.getElementById('detailBody');
+  if (!t) { body.innerHTML = '<span class="muted">任务已删除</span>'; return; }
+  document.getElementById('detailTitle').textContent = `${t.name || '未命名任务'} · ${t.resolution} ${t.codecs}`;
+  const total = t.is_dynamic ? 0 : (t.total_segments || 0);
+  const pct = total > 0 ? Math.min(100, Math.round(t.segments_done / total * 100)) : 0;
+  const m3u8 = `${location.origin}${t.playlist_url}`;
+  const modeLine = t.run_mode === 'on_demand'
+    ? `${runModeText(t.run_mode)} · 空闲 ${t.idle_secs || 0}/${t.idle_timeout_secs || 300}s`
+    : runModeText(t.run_mode);
+  const bar = total > 0
+    ? `<div style="background:#0e1116;border:1px solid #2d343d;border-radius:6px;height:14px;overflow:hidden;margin:6px 0;width:60%">
+         <div style="background:var(--acc);height:100%;width:${pct}%"></div></div>`
+    : '';
+  // 直播不显示固定总量/百分比/进度条（每轮 MPD 刷新段数动态变化）
+  const progLine = t.is_dynamic
+    ? `已产 <b>${t.segments_done}</b> 段 · 直播中`
+    : `转封装进度：${t.segments_done}${total?(' / '+total+' 段'):' 段'} ${total?('('+pct+'%)'):''}`;
+  body.innerHTML = `
+    <div>任务名：<b>${esc(t.name || '未命名任务')}</b></div>
+    <div>转化模式：${esc(modeLine)}</div>
+    <div>状态：<span class="badge s-${t.state}">${esc(t.state)}</span>　当前阶段：<b style="color:var(--acc)">${esc(t.stage||'-')}</b></div>
+    <div>${progLine}</div>
+    ${t.is_dynamic ? '' : bar}
+    <div>滚动窗口内可用段：${t.segments_available}</div>
+    <div>已下载数据：${t.mb_done.toFixed(2)} MB</div>
+	    <div>视频轨：${esc(t.video_rep_id)}</div>
+	    <div>音频轨：${esc(t.audio_rep_id||'（无）')}</div>
+	    <div>字幕轨：${t.subtitles_enabled ? esc(t.subtitle_lang || t.subtitle_rep_id || '已启用') : '（未启用）'}</div>
+    ${t.error?`<div style="color:#f85149">错误：${esc(t.error)}</div>`:''}
+    <div style="margin-top:10px">m3u8 地址（供 ffplay / VLC / 支持DV的播放器）：</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+      <input class="mono" readonly value="${esc(m3u8)}" style="flex:1" onclick="this.select()">
+      <button onclick="copyM3u8('${m3u8}', this)">复制</button>
+    </div>
+    <div class="muted" style="margin-top:8px">浏览器多不支持 HEVC/Dolby Vision 解码，请用本机播放器：</div>
+    <div style="color:var(--acc)">ffplay "${esc(m3u8)}"　|　vlc "${esc(m3u8)}"</div>`;
+}
+
+// 统一控制：action = start | pause | stop
+async function ctl(id, action){
+  try { await apiFetch(`/api/tasks/${id}/${action}`,{method:'POST'}); } catch(e){}
+  refresh();
+}
+async function delTask(id){ await apiFetch(`/api/tasks/${id}`,{method:'DELETE'}); if(id===selectedTaskId){selectedTaskId=null;document.getElementById('detailCard').classList.add('hide');} refresh(); }
+
+// 启动：若 localStorage 已存有效密钥则直接进入，否则显示登录页
+(async function init(){
+  toggleKeyMode();
+  toggleSubtitleMode();
+  if (AUTH) {
+    try {
+      const r = await fetch('/api/tasks', { headers: { 'X-Auth-Key': AUTH } });
+      if (r.ok) { enterApp(); return; }
+    } catch(e) {}
+  }
+  document.getElementById('loginMask').style.display = 'flex';
+  document.getElementById('loginKey').focus();
+})();
+</script>
+</body>
+</html>

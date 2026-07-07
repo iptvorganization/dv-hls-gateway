@@ -1,0 +1,128 @@
+name: Build Release Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64-musl
+            target: x86_64-unknown-linux-musl
+            image: x86_64-musl
+            artifact: dv-hls-gateway-linux-amd64-musl
+          - name: linux-arm64-musl
+            target: aarch64-unknown-linux-musl
+            image: aarch64-musl
+            artifact: dv-hls-gateway-linux-arm64-musl
+          - name: linux-armv7-musl
+            target: armv7-unknown-linux-musleabihf
+            image: armv7-musleabihf
+            artifact: dv-hls-gateway-linux-armv7-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          docker run --rm \
+            -v "$PWD":/home/rust/src \
+            -w /home/rust/src \
+            ghcr.io/rust-cross/rust-musl-cross:${{ matrix.image }} \
+            cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          cp target/${{ matrix.target }}/release/dv-hls-gateway ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
+          shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
+          if-no-files-found: error
+
+  windows:
+    name: windows-amd64-musl
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item target\x86_64-pc-windows-msvc\release\dv-hls-gateway.exe dv-hls-gateway-windows-amd64-musl.exe
+          certutil -hashfile dv-hls-gateway-windows-amd64-musl.exe SHA256 `
+            | Select-String -Pattern '^[0-9a-fA-F]{64}$' `
+            | ForEach-Object { "$($_.Matches.Value.ToLower())  dv-hls-gateway-windows-amd64-musl.exe" } `
+            | Set-Content dv-hls-gateway-windows-amd64-musl.exe.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dv-hls-gateway-windows-amd64-musl.exe
+          path: |
+            dv-hls-gateway-windows-amd64-musl.exe
+            dv-hls-gateway-windows-amd64-musl.exe.sha256
+          if-no-files-found: error
+
+  macos:
+    name: ${{ matrix.name }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-amd64-musl
+            target: x86_64-apple-darwin
+            artifact: dv-hls-gateway-macos-amd64-musl
+          - name: macos-arm64-musl
+            target: aarch64-apple-darwin
+            artifact: dv-hls-gateway-macos-arm64-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          cp target/${{ matrix.target }}/release/dv-hls-gateway ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
+          shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - linux
+      - windows
+      - macos
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
