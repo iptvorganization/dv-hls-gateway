@@ -140,9 +140,20 @@ async fn run_ts_inner(
             })
             .collect();
 
+        let mut skipped_live_gap = false;
         if !jobs.is_empty() {
-            let processed_until = process_ts_batch(task, dl, jobs, &mut ctx).await?;
-            next_sequence = processed_until;
+            let progress =
+                process_ts_batch(task, dl, jobs, &mut ctx, selected.video.is_live()).await?;
+            next_sequence = progress.next_sequence;
+            if let Some(skip) = progress.skipped_failure {
+                mark_ts_live_gap_boundary(
+                    task,
+                    &mut ctx,
+                    &format!("HLS TS live segment {} failed", skip.sequence),
+                );
+                next_sequence = skip.skip_to;
+                skipped_live_gap = true;
+            }
             task.resume_number.store(next_sequence, Ordering::Relaxed);
             for seg in selected
                 .video
@@ -156,6 +167,12 @@ async fn run_ts_inner(
 
         if !selected.video.is_live() {
             break;
+        }
+
+        if skipped_live_gap
+            && has_unseen_hls_segment_at_or_after(&selected.video, &seen_uris, next_sequence)
+        {
+            continue;
         }
 
         task.set_stage("等待 HLS 更新");
@@ -518,6 +535,22 @@ struct HlsTsJob {
     subtitle: Option<HlsSegment>,
 }
 
+struct HlsBatchProgress {
+    next_sequence: u64,
+    skipped_failure: Option<HlsSkippedFailure>,
+}
+
+#[derive(Clone, Copy)]
+struct HlsSkippedFailure {
+    sequence: u64,
+    skip_to: u64,
+}
+
+struct HlsSegmentFailure {
+    sequence: u64,
+    error: anyhow::Error,
+}
+
 async fn run_fmp4_inner(
     task: &Arc<Task>,
     dl: &crate::fetch::SharedDownloader,
@@ -540,10 +573,21 @@ async fn run_fmp4_inner(
 
         task.set_stage("转封装 HLS fMP4");
         let jobs = build_fmp4_jobs(&selected, next_sequence, &seen_uris);
+        let mut skipped_live_gap = false;
         if !jobs.is_empty() {
             ensure_fmp4_dynamic_keys_for_jobs(task, sel, &jobs, &mut ctx).await?;
-            let processed_until = process_fmp4_batch(task, dl, jobs, &mut ctx).await?;
-            next_sequence = processed_until;
+            let progress =
+                process_fmp4_batch(task, dl, jobs, &mut ctx, selected.video.is_live()).await?;
+            next_sequence = progress.next_sequence;
+            if let Some(skip) = progress.skipped_failure {
+                mark_fmp4_epoch_boundary(
+                    task,
+                    &mut ctx,
+                    &format!("HLS fMP4 live segment {} failed", skip.sequence),
+                );
+                next_sequence = skip.skip_to;
+                skipped_live_gap = true;
+            }
             task.resume_number.store(next_sequence, Ordering::Relaxed);
             for seg in selected
                 .video
@@ -557,6 +601,12 @@ async fn run_fmp4_inner(
 
         if !selected.video.is_live() {
             break;
+        }
+
+        if skipped_live_gap
+            && has_unseen_hls_segment_at_or_after(&selected.video, &seen_uris, next_sequence)
+        {
+            continue;
         }
 
         task.set_stage("等待 HLS 更新");
@@ -603,6 +653,24 @@ fn hls_media_sequence_rewound(old: &HlsMediaPlaylist, fresh: &HlsMediaPlaylist) 
             .zip(old.segments.first())
             .map(|(fresh_last, old_first)| fresh_last.sequence < old_first.sequence)
             .unwrap_or(false)
+}
+
+fn has_unseen_hls_segment_at_or_after(
+    playlist: &HlsMediaPlaylist,
+    seen_uris: &HashSet<String>,
+    sequence: u64,
+) -> bool {
+    playlist
+        .segments
+        .iter()
+        .any(|seg| seg.sequence >= sequence && !seen_uris.contains(&seg.uri))
+}
+
+fn hls_skip_to_after(job_order: &[u64], index: usize, sequence: u64) -> u64 {
+    job_order
+        .get(index.saturating_add(1))
+        .copied()
+        .unwrap_or_else(|| sequence.saturating_add(1))
 }
 
 struct Fmp4Context {
@@ -1048,7 +1116,8 @@ async fn process_fmp4_batch(
     dl: &crate::fetch::SharedDownloader,
     jobs: Vec<Fmp4Job>,
     ctx: &mut Fmp4Context,
-) -> crate::Result<u64> {
+    allow_live_skip_failures: bool,
+) -> crate::Result<HlsBatchProgress> {
     let batch_first = jobs.first().map(|j| j.sequence).unwrap_or(0);
     let job_order: Vec<u64> = jobs.iter().map(|j| j.sequence).collect();
     let dl2 = dl.clone();
@@ -1092,13 +1161,15 @@ async fn process_fmp4_batch(
                     None => Ok(None),
                 }
             };
-            let (venc, aenc, senc) = tokio::try_join!(video, audio, subtitle)?;
-            Ok::<_, anyhow::Error>(DownloadedFmp4Segment {
-                job,
-                venc,
-                aenc,
-                senc,
-            })
+            match tokio::try_join!(video, audio, subtitle) {
+                Ok((venc, aenc, senc)) => Ok(DownloadedFmp4Segment {
+                    job,
+                    venc,
+                    aenc,
+                    senc,
+                }),
+                Err(error) => Err(HlsSegmentFailure { sequence, error }),
+            }
         }
     }))
     .buffer_unordered(fetch_concurrency);
@@ -1106,6 +1177,7 @@ async fn process_fmp4_batch(
 
     let cancel = task.cancel_token();
     let mut pending: BTreeMap<u64, DownloadedFmp4Segment> = BTreeMap::new();
+    let mut failed: BTreeMap<u64, anyhow::Error> = BTreeMap::new();
     let mut next_index = 0usize;
     let mut next_processed = batch_first;
 
@@ -1113,10 +1185,42 @@ async fn process_fmp4_batch(
         if cancel.is_cancelled() {
             break;
         }
-        let downloaded = item?;
-        pending.insert(downloaded.job.sequence, downloaded);
+        match item {
+            Ok(downloaded) => {
+                pending.insert(downloaded.job.sequence, downloaded);
+            }
+            Err(failure) => {
+                if allow_live_skip_failures {
+                    tracing::warn!(
+                        task = %task.id,
+                        seq = failure.sequence,
+                        "HLS fMP4 segment fetch failed; will skip stale live segment: {:#}",
+                        failure.error
+                    );
+                    failed.insert(failure.sequence, failure.error);
+                } else {
+                    return Err(failure.error);
+                }
+            }
+        }
 
         while let Some(expected) = job_order.get(next_index).copied() {
+            if let Some(error) = failed.remove(&expected) {
+                let skip_to = hls_skip_to_after(&job_order, next_index, expected);
+                tracing::warn!(
+                    task = %task.id,
+                    seq = expected,
+                    skip_to,
+                    "HLS fMP4 segment failed at live head; skipping: {error:#}"
+                );
+                return Ok(HlsBatchProgress {
+                    next_sequence: skip_to,
+                    skipped_failure: Some(HlsSkippedFailure {
+                        sequence: expected,
+                        skip_to,
+                    }),
+                });
+            }
             let Some(downloaded) = pending.remove(&expected) else {
                 break;
             };
@@ -1125,7 +1229,25 @@ async fn process_fmp4_batch(
                 break;
             }
 
-            process_fmp4_segment(task, downloaded, ctx)?;
+            if let Err(error) = process_fmp4_segment(task, downloaded, ctx) {
+                if allow_live_skip_failures {
+                    let skip_to = hls_skip_to_after(&job_order, next_index, expected);
+                    tracing::warn!(
+                        task = %task.id,
+                        seq = expected,
+                        skip_to,
+                        "HLS fMP4 segment processing failed; skipping stale live segment: {error:#}"
+                    );
+                    return Ok(HlsBatchProgress {
+                        next_sequence: skip_to,
+                        skipped_failure: Some(HlsSkippedFailure {
+                            sequence: expected,
+                            skip_to,
+                        }),
+                    });
+                }
+                return Err(error);
+            }
             next_index += 1;
             next_processed = expected + 1;
             task.resume_number.store(next_processed, Ordering::Relaxed);
@@ -1134,7 +1256,10 @@ async fn process_fmp4_batch(
         }
     }
 
-    Ok(next_processed)
+    Ok(HlsBatchProgress {
+        next_sequence: next_processed,
+        skipped_failure: None,
+    })
 }
 
 async fn ensure_fmp4_dynamic_keys_for_jobs(
@@ -1487,7 +1612,8 @@ async fn process_ts_batch(
     dl: &crate::fetch::SharedDownloader,
     jobs: Vec<HlsTsJob>,
     ctx: &mut TsContext,
-) -> crate::Result<u64> {
+    allow_live_skip_failures: bool,
+) -> crate::Result<HlsBatchProgress> {
     let batch_first = jobs.first().map(|j| j.video.sequence).unwrap_or(0);
     let job_order: Vec<u64> = jobs.iter().map(|j| j.video.sequence).collect();
     let dl2 = dl.clone();
@@ -1500,7 +1626,15 @@ async fn process_ts_batch(
         async move {
             let video = job.video.clone();
             let subtitle = job.subtitle.clone();
-            let video_data = task.fetch_media(&dl, &video.uri).await?;
+            let video_data = match task.fetch_media(&dl, &video.uri).await {
+                Ok(data) => data,
+                Err(error) => {
+                    return Err(HlsSegmentFailure {
+                        sequence: video.sequence,
+                        error,
+                    });
+                }
+            };
             let subtitle_data = match subtitle.as_ref() {
                 Some(seg) => match task.fetch_media(&dl, &seg.uri).await {
                     Ok(data) => Some(data),
@@ -1522,6 +1656,10 @@ async fn process_ts_batch(
                 subtitle,
                 subtitle_data,
             })
+            .map_err(|error| HlsSegmentFailure {
+                sequence: job.video.sequence,
+                error,
+            })
         }
     }))
     .buffer_unordered(fetch_concurrency);
@@ -1529,6 +1667,7 @@ async fn process_ts_batch(
 
     let cancel = task.cancel_token();
     let mut pending: BTreeMap<u64, DownloadedHlsSegment> = BTreeMap::new();
+    let mut failed: BTreeMap<u64, anyhow::Error> = BTreeMap::new();
     let mut next_index = 0usize;
     let mut next_processed = batch_first;
 
@@ -1536,10 +1675,42 @@ async fn process_ts_batch(
         if cancel.is_cancelled() {
             break;
         }
-        let downloaded = item?;
-        pending.insert(downloaded.segment.sequence, downloaded);
+        match item {
+            Ok(downloaded) => {
+                pending.insert(downloaded.segment.sequence, downloaded);
+            }
+            Err(failure) => {
+                if allow_live_skip_failures {
+                    tracing::warn!(
+                        task = %task.id,
+                        seq = failure.sequence,
+                        "HLS TS segment fetch failed; will skip stale live segment: {:#}",
+                        failure.error
+                    );
+                    failed.insert(failure.sequence, failure.error);
+                } else {
+                    return Err(failure.error);
+                }
+            }
+        }
 
         while let Some(expected) = job_order.get(next_index).copied() {
+            if let Some(error) = failed.remove(&expected) {
+                let skip_to = hls_skip_to_after(&job_order, next_index, expected);
+                tracing::warn!(
+                    task = %task.id,
+                    seq = expected,
+                    skip_to,
+                    "HLS TS segment failed at live head; skipping: {error:#}"
+                );
+                return Ok(HlsBatchProgress {
+                    next_sequence: skip_to,
+                    skipped_failure: Some(HlsSkippedFailure {
+                        sequence: expected,
+                        skip_to,
+                    }),
+                });
+            }
             let Some(downloaded) = pending.remove(&expected) else {
                 break;
             };
@@ -1548,14 +1719,35 @@ async fn process_ts_batch(
                 break;
             }
 
-            process_downloaded_segment(task, dl, downloaded, ctx).await?;
+            if let Err(error) = process_downloaded_segment(task, dl, downloaded, ctx).await {
+                if allow_live_skip_failures {
+                    let skip_to = hls_skip_to_after(&job_order, next_index, expected);
+                    tracing::warn!(
+                        task = %task.id,
+                        seq = expected,
+                        skip_to,
+                        "HLS TS segment processing failed; skipping stale live segment: {error:#}"
+                    );
+                    return Ok(HlsBatchProgress {
+                        next_sequence: skip_to,
+                        skipped_failure: Some(HlsSkippedFailure {
+                            sequence: expected,
+                            skip_to,
+                        }),
+                    });
+                }
+                return Err(error);
+            }
             next_index += 1;
             next_processed = expected + 1;
             task.resume_number.store(next_processed, Ordering::Relaxed);
         }
     }
 
-    Ok(next_processed)
+    Ok(HlsBatchProgress {
+        next_sequence: next_processed,
+        skipped_failure: None,
+    })
 }
 
 struct DownloadedHlsSegment {
@@ -1662,6 +1854,14 @@ fn flush_ts_aggregate(task: &Arc<Task>, ctx: &mut TsContext) {
         }
     }
     task.segments_done.fetch_add(1, Ordering::Relaxed);
+}
+
+fn mark_ts_live_gap_boundary(task: &Arc<Task>, ctx: &mut TsContext, reason: &str) {
+    flush_ts_aggregate(task, ctx);
+    ctx.pending_discontinuity = true;
+    ctx.subtitle_acc.clear();
+    ctx.last_key_marker = None;
+    tracing::warn!(task = %task.id, reason, "starting a new HLS TS output discontinuity epoch");
 }
 
 fn hls_ts_key_marker(key: &HlsSegmentKey) -> Option<String> {
