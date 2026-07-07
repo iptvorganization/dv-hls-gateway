@@ -53,6 +53,15 @@ cargo build --release
 
 仓库内置 `Build Release Binaries` workflow，可手动运行，也可推送 `v*` tag 自动构建并发布附件。
 
+手动运行：
+
+1. 打开 GitHub Actions。
+2. 选择 `Build Release Binaries`。
+3. 点击 `Run workflow`。
+4. 填入 `release_tag`，例如 `v0.1.0`。
+
+手动运行会创建或更新对应 tag 的 Release。推送 tag 也会自动发布：
+
 固定产物名：
 
 | 产物 | 运行平台 | Rust target |
@@ -66,7 +75,7 @@ cargo build --release
 
 说明：`musl` 是 Linux 目标使用的 libc；Windows/macOS 没有 musl ABI，项目仍按固定产物名输出，实际 target 以表格为准。
 
-打 tag 触发构建：
+命令行打 tag 触发构建：
 
 ```bash
 git tag v0.1.0

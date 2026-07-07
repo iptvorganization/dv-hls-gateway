@@ -2,6 +2,11 @@ name: Build Release Binaries
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to create or update, for example v0.1.0"
+        required: true
+        type: string
   push:
     tags:
       - "v*"
@@ -30,7 +35,7 @@ jobs:
             image: armv7-musleabihf
             artifact: dv-hls-gateway-linux-armv7-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build
         run: |
           docker run --rm \
@@ -43,7 +48,7 @@ jobs:
           cp target/${{ matrix.target }}/release/dv-hls-gateway ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
           shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -55,7 +60,7 @@ jobs:
     name: windows-amd64-musl
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -69,7 +74,7 @@ jobs:
             | Select-String -Pattern '^[0-9a-fA-F]{64}$' `
             | ForEach-Object { "$($_.Matches.Value.ToLower())  dv-hls-gateway-windows-amd64-musl.exe" } `
             | Set-Content dv-hls-gateway-windows-amd64-musl.exe.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dv-hls-gateway-windows-amd64-musl.exe
           path: |
@@ -79,7 +84,7 @@ jobs:
 
   macos:
     name: ${{ matrix.name }}
-    runs-on: macos-latest
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
@@ -91,7 +96,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact: dv-hls-gateway-macos-arm64-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -102,7 +107,7 @@ jobs:
           cp target/${{ matrix.target }}/release/dv-hls-gateway ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
           shasum -a 256 ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: |
@@ -116,13 +121,14 @@ jobs:
       - linux
       - windows
       - macos
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: dist/*
