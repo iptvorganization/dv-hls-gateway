@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             let config = AppConfig::default();
-            match config::write_template(&config_path) {
+            match config::write_template(&config_path, &config) {
                 Ok(()) => tracing::warn!(
                     path = %config_path.display(),
                     "config file not found; wrote default template"

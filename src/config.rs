@@ -151,8 +151,8 @@ pub fn load_from_path(path: &Path) -> crate::Result<Option<AppConfig>> {
     Ok(Some(config))
 }
 
-pub fn write_template(path: &Path) -> crate::Result<()> {
-    write_config(path, &AppConfig::default())
+pub fn write_template(path: &Path, config: &AppConfig) -> crate::Result<()> {
+    write_config(path, config)
 }
 
 fn write_config(path: &Path, config: &AppConfig) -> crate::Result<()> {
@@ -198,5 +198,23 @@ mod tests {
             ("http://key-api.example.invalid/keys", "secret")
         );
         assert_eq!(config.key_api.attempts, 12);
+    }
+
+    #[test]
+    fn write_template_uses_the_runtime_auth_key() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "dv-hls-gateway-test-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        let mut config = AppConfig::default();
+        config.auth.key = "panel-secret".to_string();
+
+        write_template(&path, &config).unwrap();
+        let loaded = load_from_path(&path).unwrap().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.auth.effective_key(), "panel-secret");
     }
 }
