@@ -1,4 +1,19 @@
-# DV-HLS Gateway
+<p align="center">
+  <img src=".github/assets/dv-hls-gateway.png" width="152" height="152" alt="DV-HLS Gateway 图标">
+</p>
+
+<h1 align="center">DV-HLS Gateway</h1>
+
+<p align="center">
+  <a href="#github-actions-构建"><img src="https://img.shields.io/badge/Linux-x86__64%20%2F%20ARM64%20%2F%20ARMv7-3976B4?style=flat-square&amp;logo=linux&amp;logoColor=white" alt="Linux：x86_64、ARM64、ARMv7"></a>
+  <a href="#github-actions-构建"><img src="https://img.shields.io/badge/Windows-x86__64-3976B4?style=flat-square" alt="Windows：x86_64"></a>
+  <a href="#github-actions-构建"><img src="https://img.shields.io/badge/macOS-Intel%20%2F%20Apple%20Silicon-3976B4?style=flat-square&amp;logo=apple&amp;logoColor=white" alt="macOS：Intel、Apple Silicon"></a>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2A9461?style=flat-square" alt="MIT 许可证"></a>
+  <a href="https://t.me/iptvofficalgroup"><img src="https://img.shields.io/badge/Telegram-%E4%BA%A4%E6%B5%81%E7%BE%A4-229ED9?style=flat-square&amp;logo=telegram&amp;logoColor=white" alt="Telegram 交流群"></a>
+</p>
 
 DV-HLS Gateway 是一个纯净的手动推流器，用于把 DASH(MPD) 或 HLS(M3U8) 输入实时转封装为明文 HLS-TS 输出。
 
