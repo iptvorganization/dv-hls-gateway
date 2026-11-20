@@ -8,7 +8,7 @@ pub fn timescale_from_init(init: &[u8]) -> Option<u32> {
     parse_mdhd_timescale(mdhd)
 }
 
-fn parse_mdhd_timescale(payload: &[u8]) -> Option<u32> {
+pub(super) fn parse_mdhd_timescale(payload: &[u8]) -> Option<u32> {
     let version = *payload.first()?;
     let offset = match version {
         0 => 12,

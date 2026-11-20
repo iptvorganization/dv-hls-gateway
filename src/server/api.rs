@@ -15,14 +15,12 @@ use crate::hls::{
     looks_like_hls, parse_playlist, HlsMaster, HlsMediaPlaylist, HlsPlaylist, HlsRendition,
     HlsVariant,
 };
-use crate::mpd::{parse_mpd, Representation, TrackKind};
+use crate::mpd::{parse_mpd, MpdInfo, Representation, TrackKind};
 use crate::segment::{HlsOutput, SubtitleOutput};
-use crate::task::hls_pipeline::run_hls_pipeline;
+use crate::task::hls_pipeline::{ensure_clear_hls_master, ensure_clear_hls_media};
 use crate::task::manager::{parking_lot_lite, Task};
-use crate::task::pipeline::run_pipeline;
 use crate::task::{
-    live_tuning, manager::on_demand_idle_timeout_secs, KeyMode, RunMode, SourceKind, TaskState,
-    TrackSelection,
+    live_tuning, manager::on_demand_idle_timeout_secs, KeyMode, RunMode, SourceKind, TrackSelection,
 };
 
 use super::AppState;
@@ -60,18 +58,18 @@ pub async fn parse(
     State(st): State<Arc<AppState>>,
     Json(req): Json<ParseReq>,
 ) -> Result<Json<ParseResp>, (StatusCode, String)> {
-    let text = st
+    let manifest = st
         .mgr
         .downloader
-        .get_text(&req.mpd)
+        .get_manifest(&req.mpd)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("fetch manifest: {e:#}")))?;
-    if looks_like_hls(&text) {
-        return parse_hls_response(&st.mgr.downloader, &req.mpd, &text).await;
+    if looks_like_hls(&manifest.text) {
+        return parse_hls_response(&st.mgr.downloader, &manifest.url, &manifest.text).await;
     }
 
-    let info =
-        parse_mpd(&text, &req.mpd).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let info = parse_mpd(&manifest.text, &manifest.url)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
 
     let mut video = Vec::new();
     let mut audio = Vec::new();
@@ -130,6 +128,15 @@ pub struct CreateReq {
     #[serde(default = "default_target_dur")]
     pub target_duration: u64,
 }
+
+impl CreateReq {
+    fn discard_unused_keys(&mut self) {
+        if self.key_mode != KeyMode::Static {
+            self.keys = String::new();
+        }
+    }
+}
+
 fn default_window() -> usize {
     6
 }
@@ -178,36 +185,44 @@ pub struct CreateResp {
 
 pub async fn create_task(
     State(st): State<Arc<AppState>>,
-    Json(req): Json<CreateReq>,
+    Json(mut req): Json<CreateReq>,
 ) -> Result<Json<CreateResp>, (StatusCode, String)> {
+    req.discard_unused_keys();
     // 先解析以拿到该视频轨的元数据（codecs/分辨率/带宽）+ 判断 live
-    let text = st
+    let manifest = st
         .mgr
         .downloader
-        .get_text(&req.mpd)
+        .get_manifest(&req.mpd)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("fetch manifest: {e:#}")))?;
-    if looks_like_hls(&text) {
-        return create_hls_task(st, req, text).await;
+    if looks_like_hls(&manifest.text) {
+        return create_hls_task(st, req, &manifest.url, &manifest.text).await;
     }
 
-    let info =
-        parse_mpd(&text, &req.mpd).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let info = parse_mpd(&manifest.text, &manifest.url)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let bad_track = |e: anyhow::Error| (StatusCode::BAD_REQUEST, format!("{e:#}"));
     let vrep = info
-        .representations
-        .iter()
-        .find(|r| r.id == req.video_rep_id && r.kind == TrackKind::Video)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "video rep not found".into()))?;
-    let arep = req.audio_rep_id.as_ref().and_then(|aid| {
-        info.representations
-            .iter()
-            .find(|r| &r.id == aid && r.kind == TrackKind::Audio)
-    });
-    let srep = select_mpd_subtitle_rep(
-        &info.representations,
-        req.enable_subtitles,
-        req.subtitle_rep_id.as_deref(),
-    )?;
+        .select_representation(&req.video_rep_id, TrackKind::Video)
+        .map_err(bad_track)?;
+    let arep = req
+        .audio_rep_id
+        .as_deref()
+        .map(|id| info.select_representation(id, TrackKind::Audio))
+        .transpose()
+        .map_err(bad_track)?;
+    let srep =
+        select_mpd_subtitle_rep(&info, req.enable_subtitles, req.subtitle_rep_id.as_deref())?;
+    if req.key_mode.is_clear() {
+        for (track, rep) in [("video", Some(vrep)), ("audio", arep), ("subtitle", srep)] {
+            if rep.is_some_and(|r| r.has_content_protection) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Clear mode requires unencrypted DASH input: {track} track declares ContentProtection"),
+                ));
+            }
+        }
+    }
 
     let mut codecs = vrep.codecs.clone();
     if let Some(a) = arep {
@@ -230,7 +245,11 @@ pub async fn create_task(
     // 点播 / 直播分流：直播用滚动窗口贴 live edge；点播必须保留全部段（window=0）。
     // 否则点播会被瞬时全速下完的段不断 GC 掉，播放器只剩尾部 window 段、且 MEDIA-SEQUENCE
     // 已飙高 → 拉 seq 0.. 全部 404，表现为“断片”。
-    let window = if info.is_dynamic { req.window } else { 0 };
+    let window = if info.is_dynamic {
+        req.window.clamp(1, 120)
+    } else {
+        0
+    };
     let publish_delay =
         live_publish_delay_segments(info.is_dynamic, mpd_segment_duration_secs(vrep));
     let hls = Arc::new(HlsOutput::new(
@@ -299,14 +318,7 @@ pub async fn create_task(
         on_demand_auto_paused: std::sync::atomic::AtomicBool::new(false),
         sel,
     });
-    st.mgr.insert(task.clone());
-    if req.run_mode.is_on_demand() {
-        st.mgr.arm_on_demand_task(&id);
-    } else {
-        task.set_state(TaskState::Parsing);
-        let dl = st.mgr.downloader.clone();
-        tokio::spawn(run_pipeline(task.clone(), dl));
-    }
+    st.mgr.add_task(task);
 
     Ok(Json(CreateResp {
         id: id.clone(),
@@ -346,8 +358,9 @@ async fn parse_hls_response(
 
             for variant in &master.variants {
                 let mut segments = 0usize;
-                if let Ok(media_text) = dl.get_text(&variant.uri).await {
-                    if let Ok(HlsPlaylist::Media(media)) = parse_playlist(&media_text, &variant.uri)
+                if let Ok(manifest) = dl.get_manifest(&variant.uri).await {
+                    if let Ok(HlsPlaylist::Media(media)) =
+                        parse_playlist(&manifest.text, &manifest.url)
                     {
                         segments = media.segments.len();
                         any_live |= media.is_live();
@@ -393,26 +406,36 @@ async fn audio_tracks_from_hls_master(
     dl: &crate::fetch::SharedDownloader,
     master: &HlsMaster,
 ) -> Vec<TrackOut> {
-    futures::future::join_all(
-        master
-            .audio
-            .iter()
-            .map(|r| track_from_hls_rendition(dl, master, r)),
-    )
-    .await
+    let mut tracks = Vec::with_capacity(master.audio.len());
+    for renditions in master.audio.chunks(4) {
+        tracks.extend(
+            futures::future::join_all(
+                renditions
+                    .iter()
+                    .map(|r| track_from_hls_rendition(dl, master, r)),
+            )
+            .await,
+        );
+    }
+    tracks
 }
 
 async fn subtitle_tracks_from_hls_master(
     dl: &crate::fetch::SharedDownloader,
     master: &HlsMaster,
 ) -> Vec<TrackOut> {
-    futures::future::join_all(
-        master
-            .subtitles
-            .iter()
-            .map(|r| track_from_hls_subtitle_rendition(dl, r)),
-    )
-    .await
+    let mut tracks = Vec::with_capacity(master.subtitles.len());
+    for renditions in master.subtitles.chunks(4) {
+        tracks.extend(
+            futures::future::join_all(
+                renditions
+                    .iter()
+                    .map(|r| track_from_hls_subtitle_rendition(dl, r)),
+            )
+            .await,
+        );
+    }
+    tracks
 }
 
 async fn track_from_hls_subtitle_rendition(
@@ -421,8 +444,8 @@ async fn track_from_hls_subtitle_rendition(
 ) -> TrackOut {
     let mut segments = 0usize;
     let mut codecs = "webvtt".to_string();
-    if let Ok(text) = dl.get_text(&r.uri).await {
-        if let Ok(HlsPlaylist::Media(media)) = parse_playlist(&text, &r.uri) {
+    if let Ok(manifest) = dl.get_manifest(&r.uri).await {
+        if let Ok(HlsPlaylist::Media(media)) = parse_playlist(&manifest.text, &manifest.url) {
             segments = media.segments.len();
             if media.has_map {
                 codecs = "fmp4-subtitle".to_string();
@@ -478,8 +501,11 @@ async fn probe_hls_audio_bitrate(
     dl: &crate::fetch::SharedDownloader,
     r: &HlsRendition,
 ) -> Option<u64> {
-    let text = dl.get_text(&r.uri).await.ok()?;
-    let media = match parse_playlist(&text, &r.uri).ok()? {
+    if r.uri.is_empty() {
+        return None; // AUDIO rendition in the variant's own media segments
+    }
+    let manifest = dl.get_manifest(&r.uri).await.ok()?;
+    let media = match parse_playlist(&manifest.text, &manifest.url).ok()? {
         HlsPlaylist::Media(media) => media,
         HlsPlaylist::Master(_) => return None,
     };
@@ -510,13 +536,20 @@ fn audio_codec_from_codecs(codecs: &str) -> Option<String> {
 async fn create_hls_task(
     st: Arc<AppState>,
     req: CreateReq,
-    text: String,
+    source_url: &str,
+    text: &str,
 ) -> Result<Json<CreateResp>, (StatusCode, String)> {
-    let (variant, media) =
-        select_hls_media_playlist(&st.mgr.downloader, &req.mpd, &req.video_rep_id, &text).await?;
+    let (variant, media) = select_hls_media_playlist(
+        &st.mgr.downloader,
+        source_url,
+        &req.video_rep_id,
+        text,
+        req.key_mode,
+    )
+    .await?;
     let subtitle_rendition = select_hls_subtitle_rendition(
-        &text,
-        &req.mpd,
+        text,
+        source_url,
         &variant,
         req.enable_subtitles,
         req.subtitle_rep_id.as_deref(),
@@ -527,14 +560,20 @@ async fn create_hls_task(
         variant.codecs.clone()
     };
     let is_dynamic = media.is_live();
-    let window = if is_dynamic { req.window } else { 0 };
+    let window = if is_dynamic {
+        req.window.clamp(1, 120)
+    } else {
+        0
+    };
     let id = Uuid::new_v4().to_string();
     let task_name = normalize_task_name(&req.name);
     let publish_delay = live_publish_delay_segments(is_dynamic, hls_segment_duration_secs(&media));
     let hls = Arc::new(HlsOutput::new(
         window,
         req.target_duration.max(media.target_duration),
-        codecs.clone(),
+        // A source HLS variant lists codecs for *all* referenced audio
+        // alternates. Publish none until the remuxer knows its actual output.
+        String::new(),
         variant.video_range.clone(),
         is_dynamic,
         format!("/p/{id}"),
@@ -598,14 +637,7 @@ async fn create_hls_task(
         on_demand_auto_paused: std::sync::atomic::AtomicBool::new(false),
         sel,
     });
-    st.mgr.insert(task.clone());
-    if req.run_mode.is_on_demand() {
-        st.mgr.arm_on_demand_task(&id);
-    } else {
-        task.set_state(TaskState::Parsing);
-        let dl = st.mgr.downloader.clone();
-        tokio::spawn(run_hls_pipeline(task.clone(), dl));
-    }
+    st.mgr.add_task(task);
 
     Ok(Json(CreateResp {
         id: id.clone(),
@@ -618,11 +650,16 @@ async fn select_hls_media_playlist(
     source_url: &str,
     selected_id: &str,
     text: &str,
+    key_mode: KeyMode,
 ) -> Result<(HlsVariant, HlsMediaPlaylist), (StatusCode, String)> {
     match parse_playlist(text, source_url)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("parse hls: {e:#}")))?
     {
         HlsPlaylist::Media(media) => {
+            if key_mode.is_clear() {
+                ensure_clear_hls_media(&media, "video")
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            }
             if !selected_id.is_empty() && selected_id != "hls-0" {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -645,6 +682,10 @@ async fn select_hls_media_playlist(
             ))
         }
         HlsPlaylist::Master(master) => {
+            if key_mode.is_clear() {
+                ensure_clear_hls_master(&master)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+            }
             let variant = master
                 .variants
                 .into_iter()
@@ -655,19 +696,25 @@ async fn select_hls_media_playlist(
                         format!("HLS variant {selected_id} not found"),
                     )
                 })?;
-            let media_text = dl.get_text(&variant.uri).await.map_err(|e| {
+            let manifest = dl.get_manifest(&variant.uri).await.map_err(|e| {
                 (
                     StatusCode::BAD_GATEWAY,
                     format!("fetch HLS media playlist: {e:#}"),
                 )
             })?;
-            match parse_playlist(&media_text, &variant.uri).map_err(|e| {
+            match parse_playlist(&manifest.text, &manifest.url).map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
                     format!("parse HLS media playlist: {e:#}"),
                 )
             })? {
-                HlsPlaylist::Media(media) => Ok((variant, media)),
+                HlsPlaylist::Media(media) => {
+                    if key_mode.is_clear() {
+                        ensure_clear_hls_media(&media, "video")
+                            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+                    }
+                    Ok((variant, media))
+                }
                 HlsPlaylist::Master(_) => Err((
                     StatusCode::BAD_REQUEST,
                     "nested HLS master playlists are not supported".into(),
@@ -678,7 +725,7 @@ async fn select_hls_media_playlist(
 }
 
 fn select_mpd_subtitle_rep<'a>(
-    reps: &'a [Representation],
+    info: &'a MpdInfo,
     enabled: bool,
     selected_id: Option<&str>,
 ) -> Result<Option<&'a Representation>, (StatusCode, String)> {
@@ -686,18 +733,13 @@ fn select_mpd_subtitle_rep<'a>(
         return Ok(None);
     }
     if let Some(id) = selected_id.filter(|id| !id.trim().is_empty()) {
-        return reps
-            .iter()
-            .find(|r| r.id == id && r.kind == TrackKind::Subtitle)
+        return info
+            .select_representation(id, TrackKind::Subtitle)
             .map(Some)
-            .ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("subtitle rep {id} not found"),
-                )
-            });
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")));
     }
-    reps.iter()
+    info.representations
+        .iter()
         .find(|r| r.kind == TrackKind::Subtitle)
         .map(Some)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "no subtitle track found".into()))
@@ -788,10 +830,10 @@ pub async fn stop_task(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if st.mgr.stop(&id) {
-        (StatusCode::OK, "stopped")
-    } else {
-        (StatusCode::NOT_FOUND, "not found")
+    match st.mgr.stop(&id) {
+        Some(true) => (StatusCode::ACCEPTED, "stopping"),
+        Some(false) => (StatusCode::OK, "stopped"),
+        None => (StatusCode::NOT_FOUND, "not found"),
     }
 }
 
@@ -800,7 +842,7 @@ pub async fn pause_task(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if st.mgr.pause(&id) {
-        (StatusCode::OK, "paused")
+        (StatusCode::ACCEPTED, "pausing")
     } else {
         (StatusCode::CONFLICT, "cannot pause (not running)")
     }
@@ -815,7 +857,7 @@ pub async fn start_task(
     } else {
         (
             StatusCode::CONFLICT,
-            "cannot start (already running or not found)",
+            "cannot start (already running, finished or not found)",
         )
     }
 }
@@ -824,10 +866,54 @@ pub async fn delete_task(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(t) = st.mgr.remove(&id) {
-        t.cancel.lock().cancel();
+    if st.mgr.remove(&id).is_some() {
         (StatusCode::OK, "deleted")
     } else {
         (StatusCode::NOT_FOUND, "not found")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_creation_retains_keys_only_in_static_mode() {
+        for (mode, expected) in [("static", "example"), ("dynamic", ""), ("clear", "")] {
+            let mut req: CreateReq = serde_json::from_value(serde_json::json!({
+                "mpd": "https://example.invalid/index.m3u8",
+                "video_rep_id": "hls-0",
+                "keys": "example",
+                "key_mode": mode,
+            }))
+            .unwrap();
+            req.discard_unused_keys();
+            assert_eq!(req.keys, expected, "key_mode {mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_task_creation_rejects_hls_encryption_signals() {
+        let dl = Arc::new(crate::fetch::Downloader::new());
+        let url = "https://example.invalid/index.m3u8";
+        let clear = "#EXTM3U\n#EXTINF:4,\nclear.ts\n";
+        let protected = concat!(
+            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n",
+            "#EXTINF:4,\nprotected.ts\n",
+        );
+        assert!(
+            select_hls_media_playlist(&dl, url, "hls-0", clear, KeyMode::Clear)
+                .await
+                .is_ok()
+        );
+        let (status, _) = select_hls_media_playlist(&dl, url, "hls-0", protected, KeyMode::Clear)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            select_hls_media_playlist(&dl, url, "hls-0", protected, KeyMode::Static)
+                .await
+                .is_ok()
+        );
     }
 }

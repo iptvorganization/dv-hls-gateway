@@ -103,13 +103,17 @@
       <input id="onDemandMode" type="checkbox">
       <span>按需启停（5分钟空闲暂停）</span>
     </label>
-	    <label class="inline-control">
-	      <input id="dynamicKey" type="checkbox" onchange="toggleKeyMode()">
-	      <span>动态取 Key</span>
-	    </label>
-	    <label class="inline-control">
-	      <input id="subtitleMode" type="checkbox" onchange="toggleSubtitleMode()">
-	      <span>推流字幕</span>
+		    <label class="inline-control">
+		      <input id="dynamicKey" type="checkbox" onchange="toggleKeyMode(event)">
+		      <span>动态取 Key</span>
+		    </label>
+		    <label class="inline-control">
+		      <input id="clearKey" type="checkbox" onchange="toggleKeyMode(event)">
+		      <span>无需 Key（明文源）</span>
+		    </label>
+		    <label class="inline-control">
+		      <input id="subtitleMode" type="checkbox" onchange="toggleSubtitleMode()">
+		      <span>推流字幕</span>
 	    </label>
     <label id="keysLabel">KEYS（每行一个 KID:KEY，按 KID 自动匹配视频/音频轨道）</label>
     <textarea id="keys" class="mono" rows="3" placeholder="00112233...:ffeeddcc...&#10;11223344...:00ffeedd..." style="width:100%;padding:8px 10px;background:#0e1116;border:1px solid #2d343d;border-radius:6px;color:var(--txt);font-size:13px;resize:vertical"></textarea>
@@ -173,10 +177,17 @@ let selectedTaskId = null;
 let AUTH = localStorage.getItem('dvhls_key') || '';
 let refreshTimer = null;
 
-function esc(v) {
-  return String(v ?? '').replace(/[&<>"']/g, ch => ({
-    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
-  }[ch]));
+function element(tag, text, className) {
+  const node = document.createElement(tag);
+  if (text != null) node.textContent = String(text);
+  if (className) node.className = className;
+  return node;
+}
+
+function button(text, action, className = 'ghost') {
+  const node = element('button', text, className);
+  node.addEventListener('click', () => action(node));
+  return node;
 }
 
 function runModeText(mode) {
@@ -197,7 +208,7 @@ async function doLogin() {
   // 用一次 API 校验密钥
   try {
     const r = await fetch('/api/tasks', { headers: { 'X-Auth-Key': k } });
-    if (r.status === 401) { document.getElementById('loginErr').textContent = '密钥错误'; return; }
+    if (!r.ok) { document.getElementById('loginErr').textContent = r.status === 401 ? '密钥错误' : `连接失败: HTTP ${r.status}`; return; }
     AUTH = k;
     localStorage.setItem('dvhls_key', k);
     enterApp();
@@ -243,15 +254,24 @@ function closeTracks() {
   document.getElementById('trackArea').classList.add('hide');
 }
 
-function toggleKeyMode() {
-  const dynamic = document.getElementById('dynamicKey').checked;
+function toggleKeyMode(ev) {
+  const dynamicEl = document.getElementById('dynamicKey');
+  const clearEl = document.getElementById('clearKey');
+  if (ev && ev.target === dynamicEl && dynamicEl.checked) clearEl.checked = false;
+  if (ev && ev.target === clearEl && clearEl.checked) dynamicEl.checked = false;
+  const dynamic = dynamicEl.checked;
+  const clear = clearEl.checked;
   const keys = document.getElementById('keys');
   const label = document.getElementById('keysLabel');
-  keys.disabled = dynamic;
-  keys.placeholder = dynamic
+  keys.disabled = dynamic || clear;
+  keys.placeholder = clear
+    ? '无需 Key 模式：明文源不填写、不解析、不请求 key'
+    : dynamic
     ? '动态模式：自动解析 KID 并请求本地取 key 接口'
     : '00112233...:ffeeddcc...\n11223344...:00ffeedd...';
-  label.textContent = dynamic
+  label.textContent = clear
+    ? 'KEYS（无需 Key 模式无需填写）'
+    : dynamic
     ? 'KEYS（动态模式无需填写）'
     : 'KEYS（每行一个 KID:KEY，按 KID 自动匹配视频/音频轨道）';
 }
@@ -265,10 +285,10 @@ function toggleSubtitleMode() {
 
 function renderTracks() {
   const vt = document.getElementById('vtracks'), at = document.getElementById('atracks'), st = document.getElementById('stracks');
-  vt.innerHTML = ''; at.innerHTML = ''; st.innerHTML = ''; selV = null; selA = null; selS = null;
+  vt.replaceChildren(); at.replaceChildren(); st.replaceChildren(); selV = null; selA = null; selS = null;
   parsed.video.forEach((t,i) => {
     const d = document.createElement('div');
-    d.innerHTML = `<b>${t.resolution||'?'}</b> · ${(t.bandwidth/1e6).toFixed(2)}Mbps · <span class="mono">${t.codecs}</span>`;
+    d.append(element('b', t.resolution || '?'), ` · ${(t.bandwidth / 1e6).toFixed(2)}Mbps · `, element('span', t.codecs, 'mono'));
     d.onclick = () => { selV = t.id; [...vt.children].forEach(c=>c.classList.remove('sel')); d.classList.add('sel'); };
     if (i===0) { selV=t.id; d.classList.add('sel'); }
     vt.appendChild(d);
@@ -279,7 +299,7 @@ function renderTracks() {
   parsed.audio.forEach(t => {
     const d = document.createElement('div');
     const rate = t.bandwidth ? ` · ${(t.bandwidth/1e3).toFixed(0)}kbps` : '';
-    d.innerHTML = `${t.lang||'?'} · <span class="mono">${t.codecs}</span>${rate}`;
+    d.append(`${t.lang || '?'} · `, element('span', t.codecs, 'mono'), rate);
     d.onclick = () => { selA = t.id; [...at.children].forEach(c=>c.classList.remove('sel')); d.classList.add('sel'); };
     at.appendChild(d);
   });
@@ -289,7 +309,7 @@ function renderTracks() {
   st.appendChild(noSub);
   (parsed.subtitles || []).forEach((t, i) => {
     const d = document.createElement('div');
-    d.innerHTML = `${t.lang||'?'} · <span class="mono">${t.codecs||'subtitle'}</span>${t.segments ? ` · ${t.segments}段` : ''}`;
+    d.append(`${t.lang || '?'} · `, element('span', t.codecs || 'subtitle', 'mono'), t.segments ? ` · ${t.segments}段` : '');
     d.onclick = () => { selS = t.id; [...st.children].forEach(c=>c.classList.remove('sel')); d.classList.add('sel'); };
     if (i === 0) { selS = t.id; d.classList.add('sel'); }
     st.appendChild(d);
@@ -303,16 +323,15 @@ async function doCreate() {
   const name = document.getElementById('taskName').value.trim();
   if (!name) return alert('请输入任务名称');
   const dynamicKey = document.getElementById('dynamicKey').checked;
+  const clearKey = document.getElementById('clearKey').checked;
+  const keyMode = clearKey ? 'clear' : (dynamicKey ? 'dynamic' : 'static');
   const onDemandMode = document.getElementById('onDemandMode').checked;
   const subtitleMode = document.getElementById('subtitleMode').checked;
-  const keys = document.getElementById('keys').value.trim();
-  if (!dynamicKey && !keys) return alert('请输入 KEYS，或开启动态取 Key');
   if (subtitleMode && !(parsed.subtitles || []).length) return alert('当前链接没有可用字幕轨道');
   const body = {
     name,
     mpd: document.getElementById('mpd').value.trim(),
-    keys,
-    key_mode: dynamicKey ? 'dynamic' : 'static',
+    key_mode: keyMode,
     run_mode: onDemandMode ? 'on_demand' : 'always',
     video_rep_id: selV,
     audio_rep_id: selA,
@@ -321,6 +340,11 @@ async function doCreate() {
     window: parseInt(document.getElementById('window').value)||6,
     target_duration: parseInt(document.getElementById('tdur').value)||7,
   };
+  if (keyMode === 'static') {
+    const keys = document.getElementById('keys').value.trim();
+    if (!keys) return alert('请输入 KEYS，或开启动态取 Key / 无需 Key');
+    body.keys = keys;
+  }
   try {
     const r = await apiFetch('/api/tasks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
     if (!r.ok) throw new Error(await r.text());
@@ -333,42 +357,51 @@ async function doCreate() {
 async function refresh() {
   try {
     const r = await apiFetch('/api/tasks'); const tasks = await r.json();
-    const tb = document.getElementById('taskBody'); tb.innerHTML = '';
+    const tb = document.getElementById('taskBody');
+    const rows = [];
     let detailTask = null;
-    tasks.forEach(t => {
+    for (const t of tasks) {
       if (t.id === selectedTaskId) detailTask = t;
-      // 直播进度：不显示固定总量(每轮刷新 MPD 会变)，VOD 显示 N/M(%)
-      const liveProg = t.is_dynamic
-        ? `已产 ${t.segments_done} 段`
-        : (() => { const tot = t.total_segments||0; const pct = tot ? Math.round(t.segments_done/tot*100) : 0;
-            return `${t.segments_done}/${tot} (${pct}%)`; })();
-      const modeLine = t.run_mode === 'on_demand'
-        ? `${runModeText(t.run_mode)} · 空闲 ${t.idle_secs || 0}/${t.idle_timeout_secs || 300}s`
-        : runModeText(t.run_mode);
+      const total = t.total_segments || 0;
+      const progress = t.is_dynamic ? `已产 ${t.segments_done} 段`
+        : `${t.segments_done}/${total} (${total ? Math.round(t.segments_done / total * 100) : 0}%)`;
+      const mode = t.run_mode === 'on_demand'
+        ? `${runModeText(t.run_mode)} · 空闲 ${t.idle_secs || 0}/${t.idle_timeout_secs || 300}s` : runModeText(t.run_mode);
+      const subtitles = t.subtitles_enabled ? ` · 字幕 ${t.subtitle_lang || t.subtitle_rep_id || 'on'}` : '';
       const m3u8 = `${location.origin}${t.playlist_url}`;
-      const subtitleLine = t.subtitles_enabled ? ` · 字幕 ${t.subtitle_lang || t.subtitle_rep_id || 'on'}` : '';
-      // 按状态决定控制按钮：运行中→[暂停][停止]；其余→[启动]
-      const running = (t.state === 'running' || t.state === 'parsing');
-      const ctrl = running
-        ? `<button class="ghost" onclick="ctl('${t.id}','pause')">暂停</button>
-           <button class="ghost" onclick="ctl('${t.id}','stop')">停止</button>`
-        : `<button class="ghost" style="color:var(--ok);border-color:var(--ok)" onclick="ctl('${t.id}','start')">启动</button>`;
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td data-label="任务名"><b>${esc(t.name || '未命名任务')}</b><div class="muted">${esc(modeLine)}${esc(subtitleLine)}</div><div class="muted mono">${esc(t.source_kind || '')}</div></td>
-        <td data-label="状态"><span class="badge s-${t.state}">${esc(t.state)}</span>${t.error?`<div class="muted" style="color:#f85149;max-width:200px">${esc(t.error)}</div>`:''}</td>
-        <td data-label="阶段">${esc(t.stage||'')}</td>
-        <td data-label="分辨率">${esc(t.resolution)}</td>
-        <td data-label="CODECS" class="mono">${esc(t.codecs)}</td>
-        <td data-label="进度">${liveProg}<div class="muted">窗口 ${t.segments_available} · ${t.mb_done.toFixed(1)}MB</div></td>
-        <td data-label="m3u8"><button class="ghost" onclick="copyM3u8('${m3u8}', this)">复制 m3u8</button></td>
-        <td data-label="操作" class="action-cell"><div class="task-actions">
-          <button class="ghost" onclick="showDetail('${t.id}')">详情</button>
-          ${ctrl}
-          <button class="danger" onclick="delTask('${t.id}')">删除</button>
-        </div></td>`;
-      tb.appendChild(tr);
-    });
+      const tr = element('tr');
+      const cell = (label, ...content) => {
+        const td = element('td');
+        td.dataset.label = label;
+        td.append(...content);
+        tr.append(td);
+        return td;
+      };
+      cell('任务名', element('b', t.name || '未命名任务'), element('div', mode + subtitles, 'muted'), element('div', t.source_kind || '', 'muted mono'));
+      const status = cell('状态', element('span', t.state, `badge s-${t.state}`));
+      if (t.error) {
+        const error = element('div', t.error, 'muted');
+        error.style.color = '#f85149';
+        error.style.maxWidth = '200px';
+        status.append(error);
+      }
+      cell('阶段', t.stage || '');
+      cell('分辨率', t.resolution);
+      cell('CODECS', t.codecs).className = 'mono';
+      cell('进度', progress, element('div', `窗口 ${t.segments_available} · ${t.mb_done.toFixed(1)}MB`, 'muted'));
+      cell('m3u8', button('复制 m3u8', btn => copyM3u8(m3u8, btn)));
+      const actions = element('div', null, 'task-actions');
+      actions.append(button('详情', () => showDetail(t.id)));
+      if (t.state === 'running' || t.state === 'parsing') {
+        actions.append(button('暂停', () => ctl(t.id, 'pause')), button('停止', () => ctl(t.id, 'stop')));
+      } else {
+        actions.append(button('启动', () => ctl(t.id, 'start')));
+      }
+      actions.append(button('删除', () => delTask(t.id), 'danger'));
+      cell('操作', actions).className = 'action-cell';
+      rows.push(tr);
+    }
+    tb.replaceChildren(...rows);
     if (selectedTaskId) renderDetail(detailTask);
   } catch(e) {}
 }
@@ -416,43 +449,50 @@ function closeDetail() {
 }
 
 function renderDetail(t) {
-  const card = document.getElementById('detailCard');
   const body = document.getElementById('detailBody');
-  if (!t) { body.innerHTML = '<span class="muted">任务已删除</span>'; return; }
+  body.replaceChildren();
+  if (!t) { body.append(element('span', '任务已删除', 'muted')); return; }
   document.getElementById('detailTitle').textContent = `${t.name || '未命名任务'} · ${t.resolution} ${t.codecs}`;
+  const row = (...content) => {
+    const line = element('div');
+    line.append(...content);
+    body.append(line);
+    return line;
+  };
   const total = t.is_dynamic ? 0 : (t.total_segments || 0);
   const pct = total > 0 ? Math.min(100, Math.round(t.segments_done / total * 100)) : 0;
   const m3u8 = `${location.origin}${t.playlist_url}`;
-  const modeLine = t.run_mode === 'on_demand'
+  const mode = t.run_mode === 'on_demand'
     ? `${runModeText(t.run_mode)} · 空闲 ${t.idle_secs || 0}/${t.idle_timeout_secs || 300}s`
     : runModeText(t.run_mode);
-  const bar = total > 0
-    ? `<div style="background:#0e1116;border:1px solid #2d343d;border-radius:6px;height:14px;overflow:hidden;margin:6px 0;width:60%">
-         <div style="background:var(--acc);height:100%;width:${pct}%"></div></div>`
-    : '';
-  // 直播不显示固定总量/百分比/进度条（每轮 MPD 刷新段数动态变化）
-  const progLine = t.is_dynamic
-    ? `已产 <b>${t.segments_done}</b> 段 · 直播中`
-    : `转封装进度：${t.segments_done}${total?(' / '+total+' 段'):' 段'} ${total?('('+pct+'%)'):''}`;
-  body.innerHTML = `
-    <div>任务名：<b>${esc(t.name || '未命名任务')}</b></div>
-    <div>转化模式：${esc(modeLine)}</div>
-    <div>状态：<span class="badge s-${t.state}">${esc(t.state)}</span>　当前阶段：<b style="color:var(--acc)">${esc(t.stage||'-')}</b></div>
-    <div>${progLine}</div>
-    ${t.is_dynamic ? '' : bar}
-    <div>滚动窗口内可用段：${t.segments_available}</div>
-    <div>已下载数据：${t.mb_done.toFixed(2)} MB</div>
-	    <div>视频轨：${esc(t.video_rep_id)}</div>
-	    <div>音频轨：${esc(t.audio_rep_id||'（无）')}</div>
-	    <div>字幕轨：${t.subtitles_enabled ? esc(t.subtitle_lang || t.subtitle_rep_id || '已启用') : '（未启用）'}</div>
-    ${t.error?`<div style="color:#f85149">错误：${esc(t.error)}</div>`:''}
-    <div style="margin-top:10px">m3u8 地址（供 ffplay / VLC / 支持DV的播放器）：</div>
-    <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
-      <input class="mono" readonly value="${esc(m3u8)}" style="flex:1" onclick="this.select()">
-      <button onclick="copyM3u8('${m3u8}', this)">复制</button>
-    </div>
-    <div class="muted" style="margin-top:8px">浏览器多不支持 HEVC/Dolby Vision 解码，请用本机播放器：</div>
-    <div style="color:var(--acc)">ffplay "${esc(m3u8)}"　|　vlc "${esc(m3u8)}"</div>`;
+  row('任务名：', element('b', t.name || '未命名任务'));
+  row(`转化模式：${mode}`);
+  row('状态：', element('span', t.state, `badge s-${t.state}`), '　当前阶段：', element('b', t.stage || '-'));
+  row(t.is_dynamic ? `已产 ${t.segments_done} 段 · 直播中`
+    : `转封装进度：${t.segments_done}${total ? ` / ${total} 段 (${pct}%)` : ' 段'}`);
+  if (total) {
+    const progress = element('progress');
+    progress.max = 100;
+    progress.value = pct;
+    row(progress);
+  }
+  row(`滚动窗口内可用段：${t.segments_available}`);
+  row(`已下载数据：${t.mb_done.toFixed(2)} MB`);
+  row(`视频轨：${t.video_rep_id}`);
+  row(`音频轨：${t.audio_rep_id || '（无）'}`);
+  row(`字幕轨：${t.subtitles_enabled ? t.subtitle_lang || t.subtitle_rep_id || '已启用' : '（未启用）'}`);
+  if (t.error) row(`错误：${t.error}`).style.color = '#f85149';
+  row('m3u8 地址（供 ffplay / VLC / 支持DV的播放器）：').style.marginTop = '10px';
+  const input = element('input', null, 'mono');
+  input.readOnly = true;
+  input.value = m3u8;
+  input.style.flex = '1';
+  input.addEventListener('click', () => input.select());
+  row(input, button('复制', btn => copyM3u8(m3u8, btn))).style.cssText = 'display:flex;gap:8px;align-items:center;margin-top:4px';
+  const hint = row('浏览器多不支持 HEVC/Dolby Vision 解码，请用本机播放器：');
+  hint.className = 'muted';
+  hint.style.marginTop = '8px';
+  row(`ffplay "${m3u8}"　|　vlc "${m3u8}"`).style.color = 'var(--acc)';
 }
 
 // 统一控制：action = start | pause | stop

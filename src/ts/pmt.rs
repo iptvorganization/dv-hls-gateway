@@ -1,6 +1,6 @@
 //! PMT (Program Map Table) section 构造，含 视频 + 音频 ES，DV 时视频挂 DOVI descriptor。
 
-use super::descriptor::dolby_vision_descriptor;
+use super::descriptor::{dolby_vision_descriptor, AC4_ES_DESCRIPTORS};
 use super::pat::finish_section;
 use super::{AudioCodec, VideoCodec, PID_VIDEO};
 use crate::mp4::DoviConfig;
@@ -37,7 +37,12 @@ pub fn build_pmt_section(
 
     // ── ES loop 2: audio ──
     if let Some((apid, codec)) = audio {
-        push_es(&mut s, codec.stream_type(), apid, &[]);
+        let descriptors: &[u8] = if codec == AudioCodec::Ac4 {
+            &AC4_ES_DESCRIPTORS
+        } else {
+            &[]
+        };
+        push_es(&mut s, codec.stream_type(), apid, descriptors);
     }
 
     finish_section(&mut s);
@@ -108,6 +113,7 @@ mod tests {
         let cases = [
             (AudioCodec::Ac3, 0x81),
             (AudioCodec::Ec3, 0x87),
+            (AudioCodec::Ac4, 0x06),
             (AudioCodec::AacAdts, 0x0F),
         ];
 
@@ -117,6 +123,26 @@ mod tests {
             let types = es_stream_types(&pmt);
             assert_eq!(types, vec![0x24, expected_stream_type]);
         }
+    }
+
+    #[test]
+    fn pmt_ac4_descriptors_belong_to_audio_es_and_crc_matches() {
+        let pmt = build_pmt_section(
+            PID_VIDEO,
+            VideoCodec::Hevc,
+            Some((PID_AUDIO, AudioCodec::Ac4)),
+            Some(&cfg_p5()),
+        );
+        let audio = 12 + 5 + 7; // after PMT header and video ES with its seven-byte DV descriptor
+        assert_eq!(
+            &pmt[audio..pmt.len() - 4],
+            &[
+                0x06, 0xe1, 0x01, 0xf0, 0x0a, 0x05, 0x04, 0x41, 0x43, 0x2d, 0x34, 0x7f, 0x02, 0x15,
+                0
+            ]
+        );
+        let (section, crc) = pmt.split_at(pmt.len() - 4);
+        assert_eq!(crc, mpeg_crc32(section).to_be_bytes());
     }
 
     fn es_stream_types(pmt: &[u8]) -> Vec<u8> {

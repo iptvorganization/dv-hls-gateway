@@ -3,7 +3,7 @@
 //! mp4 里的 AAC 是 raw（无同步头），进 MPEG-TS 必须封成 ADTS（每帧 7 字节头），
 //! 否则播放器无法解析采样率/声道。EC-3/AC-3 自带 syncframe，无需此处理。
 
-use super::boxes::{find_box, CONTAINERS};
+use super::ac4::audio_sample_entry_config;
 
 /// AAC 音频规格（来自 AudioSpecificConfig）。
 #[derive(Debug, Clone, Copy)]
@@ -44,10 +44,8 @@ impl AacConfig {
 
     /// 在 init 段里查找 esds → AudioSpecificConfig。
     pub fn find_in_init(init: &[u8]) -> Option<Self> {
-        let esds = find_box(init, b"esds", CONTAINERS).or_else(|| scan_anywhere(init, b"esds"))?;
-        // esds: version/flags(4) + tags。找 DecoderSpecificInfo tag=0x05。
-        let asc = extract_asc_from_esds(esds)?;
-        Self::parse_asc(&asc)
+        let esds = audio_sample_entry_config(init, b"mp4a", b"esds").ok()??;
+        Self::parse_asc(extract_asc_from_esds(esds)?)
     }
 
     /// ADTS profile 字段 = objectType - 1（AAC-LC=2 → profile=1）。
@@ -85,46 +83,37 @@ impl AacConfig {
     }
 }
 
-fn extract_asc_from_esds(esds: &[u8]) -> Option<Vec<u8>> {
-    // 跳过 version/flags(4)，扫描找 tag 0x05 (DecSpecificInfo)，其后是长度(可能多字节)+ASC
-    let mut i = 4;
-    while i < esds.len() {
-        if esds[i] == 0x05 {
-            // 解析 expandable size（0x80 续位）
-            let mut p = i + 1;
-            let mut len = 0usize;
-            for _ in 0..4 {
-                if p >= esds.len() {
-                    return None;
-                }
-                let b = esds[p];
-                len = (len << 7) | (b & 0x7F) as usize;
-                p += 1;
-                if b & 0x80 == 0 {
-                    break;
-                }
-            }
-            if p + len <= esds.len() && len >= 2 {
-                return Some(esds[p..p + len].to_vec());
-            }
-            return None;
-        }
-        i += 1;
+fn extract_asc_from_esds(esds: &[u8]) -> Option<&[u8]> {
+    // esds FullBox -> ES_Descriptor -> DecoderConfigDescriptor ->
+    // DecoderSpecificInfo. A 0x05 byte elsewhere isn't an ASC descriptor.
+    let es = descriptor(esds.get(4..)?, 0x03)?;
+    let flags = *es.get(2)?;
+    let mut child = 3 + usize::from(flags & 0x80 != 0) * 2;
+    if flags & 0x40 != 0 {
+        child += 1 + usize::from(*es.get(child)?);
     }
-    None
+    if flags & 0x20 != 0 {
+        child += 2;
+    }
+    let decoder = descriptor(es.get(child..)?, 0x04)?;
+    // MP4RA OTI: MPEG-4 Audio or MPEG-2 AAC Main/LC/SSR, not MP3, etc.
+    if !matches!(decoder.first()?, 0x40 | 0x66..=0x68) || *decoder.get(1)? >> 2 != 5 {
+        return None;
+    }
+    descriptor(decoder.get(13..)?, 0x05)
 }
 
-fn scan_anywhere<'a>(data: &'a [u8], target: &[u8; 4]) -> Option<&'a [u8]> {
-    let mut i = 0;
-    while i + 8 <= data.len() {
-        if &data[i + 4..i + 8] == target {
-            let size =
-                u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
-            if size >= 8 && i + size <= data.len() {
-                return Some(&data[i + 8..i + size]);
-            }
+fn descriptor(data: &[u8], tag: u8) -> Option<&[u8]> {
+    if *data.first()? != tag {
+        return None;
+    }
+    let mut len = 0;
+    for i in 1..=4 {
+        let byte = *data.get(i)?;
+        len = (len << 7) | usize::from(byte & 0x7f);
+        if byte & 0x80 == 0 {
+            return data.get(i + 1..i + 1 + len);
         }
-        i += 1;
     }
     None
 }
@@ -172,9 +161,14 @@ mod tests {
 
     #[test]
     fn extract_asc() {
-        // 构造最小 esds: ver/flags(4) + ...05 02 1190
-        let esds = vec![0, 0, 0, 0, 0x05, 0x02, 0x11, 0x90];
-        let asc = extract_asc_from_esds(&esds).unwrap();
-        assert_eq!(asc, vec![0x11, 0x90]);
+        let mut esds = [
+            0, 0, 0, 0, 0x03, 0x80, 0x80, 0x80, 22, 0, 1, 0, 0x04, 17, 0x40, 0x15, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0x05, 2, 0x11, 0x90,
+        ];
+        assert_eq!(extract_asc_from_esds(&esds), Some(&[0x11, 0x90][..]));
+        assert!(extract_asc_from_esds(&esds[..esds.len() - 1]).is_none());
+        esds[14] = 0x6b; // MPEG-1 audio, even if its data looks like AAC ASC
+        assert!(extract_asc_from_esds(&esds).is_none());
+        assert!(extract_asc_from_esds(&[0, 0, 0, 0, 0x05, 0x02, 0x11, 0x90]).is_none());
     }
 }

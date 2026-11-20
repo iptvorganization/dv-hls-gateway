@@ -3,13 +3,16 @@
 //! media 段：`moof`→`traf`→{`tfhd`,`trun`,`saiz`,`saio`,`senc`}、`mdat`
 
 pub mod aac;
+pub mod ac4;
 pub mod avcc;
 pub mod boxes;
 pub mod dvcc;
 pub mod hvcc;
 pub mod mdhd;
+pub(crate) mod protection;
 pub mod sample;
 pub mod tenc;
+pub mod tracks;
 
 pub use dvcc::DoviConfig;
 pub use hvcc::ParamSets;

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -77,11 +77,16 @@ pub enum KeyMode {
     #[default]
     Static,
     Dynamic,
+    Clear,
 }
 
 impl KeyMode {
     pub fn is_dynamic(self) -> bool {
         matches!(self, KeyMode::Dynamic)
+    }
+
+    pub fn is_clear(self) -> bool {
+        matches!(self, KeyMode::Clear)
     }
 }
 
@@ -189,6 +194,17 @@ impl Task {
     pub fn is_on_demand_auto_paused(&self) -> bool {
         self.on_demand_auto_paused.load(Ordering::Relaxed)
     }
+
+    fn discard_incomplete_vod(&self) {
+        self.hls.clear_segments_keep_sequence();
+        self.subtitles.clear_segments_keep_sequence();
+        self.resume_number.store(0, Ordering::Relaxed);
+        self.acc_v_dts.store(0, Ordering::Relaxed);
+        self.acc_a_dts.store(0, Ordering::Relaxed);
+        self.origin_v_tfdt.store(u64::MAX, Ordering::Relaxed);
+        self.origin_a_tfdt.store(u64::MAX, Ordering::Relaxed);
+        self.segments_done.store(0, Ordering::Relaxed);
+    }
     pub fn configure_fetch_tuning(&self, short_source: bool) {
         self.fetch_tuning.configure_source(&self.id, short_source);
     }
@@ -203,7 +219,10 @@ impl Task {
         let cancel = self.cancel_token();
         let _permit = self.fetch_tuning.acquire_shared(&cancel).await?;
         let started = Instant::now();
-        let result = dl.get(url).await;
+        let result = tokio::select! {
+            _ = cancel.cancelled() => return Err(anyhow::anyhow!("media download cancelled")),
+            result = dl.get(url) => result,
+        };
         let elapsed = started.elapsed();
         if result.is_ok() {
             self.fetch_tuning.record_success(&self.id, elapsed);
@@ -259,8 +278,15 @@ pub struct TaskStatus {
 
 #[derive(Clone)]
 pub struct TaskManager {
-    tasks: Arc<DashMap<String, Arc<Task>>>,
+    tasks: Arc<DashMap<String, TaskSlot>>,
     pub downloader: SharedDownloader,
+}
+
+struct TaskSlot {
+    task: Arc<Task>,
+    // Protected by the DashMap entry lock. Only the supervisor clears it,
+    // after the worker has joined, so a stop/resume cannot overlap workers.
+    running: bool,
 }
 
 impl TaskManager {
@@ -271,71 +297,162 @@ impl TaskManager {
         }
     }
 
-    pub fn insert(&self, task: Arc<Task>) {
-        self.tasks.insert(task.id.clone(), task);
+    pub fn add_task(&self, task: Arc<Task>) {
+        let id = task.id.clone();
+        let on_demand = task.run_mode.is_on_demand();
+        let Entry::Vacant(entry) = self.tasks.entry(id.clone()) else {
+            tracing::error!(task = %id, "duplicate task id");
+            return;
+        };
+        let mut slot = entry.insert(TaskSlot {
+            task,
+            running: false,
+        });
+        if on_demand {
+            slot.task.set_paused(true);
+            slot.task
+                .on_demand_auto_paused
+                .store(true, Ordering::Relaxed);
+            slot.task.set_stage("等待播放请求");
+            slot.task.set_state(TaskState::Paused);
+        } else {
+            self.spawn_locked(&mut slot, "启动中");
+        }
+        drop(slot);
+        if on_demand {
+            self.spawn_on_demand_idle_watcher(id);
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Task>> {
-        self.tasks.get(id).map(|t| t.clone())
+        self.tasks.get(id).map(|slot| slot.task.clone())
     }
 
     pub fn remove(&self, id: &str) -> Option<Arc<Task>> {
-        self.tasks.remove(id).map(|(_, t)| t)
+        let (_, slot) = self.tasks.remove(id)?;
+        slot.task.cancel.lock().cancel();
+        Some(slot.task)
     }
 
-    pub fn spawn_task_pipeline(&self, task: Arc<Task>, stage: &str) {
-        *task.cancel.lock() = CancellationToken::new();
+    fn spawn_locked(&self, slot: &mut TaskSlot, stage: &str) {
+        debug_assert!(!slot.running);
+        slot.running = true;
+        let task = slot.task.clone();
+        let cancel = CancellationToken::new();
+        *task.cancel.lock() = cancel.clone();
         task.set_paused(false);
         task.on_demand_auto_paused.store(false, Ordering::Relaxed);
         if task.run_mode.is_on_demand() {
             task.mark_playback_request();
         }
-        task.set_state(TaskState::Running);
+        task.hls.mark_next_discontinuity();
+        task.error_msg.lock().clear();
         task.set_stage(stage);
+        task.set_state(TaskState::Running);
+        let mgr = self.clone();
         let dl = self.downloader.clone();
-        match task.source_kind {
-            SourceKind::Mpd => {
-                tokio::spawn(crate::task::pipeline::run_pipeline(task, dl));
-            }
-            SourceKind::Hls => {
-                tokio::spawn(crate::task::hls_pipeline::run_hls_pipeline(task, dl));
-            }
-        }
+        let id = task.id.clone();
+        tokio::spawn(async move {
+            let mut worker = tokio::spawn(async move {
+                match task.source_kind {
+                    SourceKind::Mpd => super::pipeline::run_pipeline(task, dl).await,
+                    SourceKind::Hls => super::hls_pipeline::run_hls_pipeline(task, dl).await,
+                }
+            });
+            let result = tokio::select! {
+                result = &mut worker => result,
+                _ = cancel.cancelled() => {
+                    // Give the pipeline a chance to flush already validated output.
+                    match tokio::time::timeout(Duration::from_secs(2), &mut worker).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            worker.abort();
+                            worker.await
+                        }
+                    }
+                }
+            };
+            mgr.worker_finished(&id, result, cancel.is_cancelled());
+        });
     }
 
-    pub fn arm_on_demand_task(&self, id: &str) {
-        if let Some(t) = self.get(id) {
-            t.set_paused(true);
-            t.on_demand_auto_paused.store(true, Ordering::Relaxed);
-            t.set_state(TaskState::Paused);
-            t.set_stage("等待播放请求");
+    fn worker_finished(
+        &self,
+        id: &str,
+        result: Result<crate::Result<()>, tokio::task::JoinError>,
+        cancelled: bool,
+    ) {
+        let Some(mut slot) = self.tasks.get_mut(id) else {
+            return;
+        };
+        slot.running = false;
+        let task = slot.task.clone();
+        // Recheck under the same lock as pause/stop so a late cancel cannot
+        // be lost between JoinHandle completion and the terminal transition.
+        let cancelled = cancelled || task.cancel_token().is_cancelled();
+        if cancelled {
+            // An aborted worker may have advanced its input cursor while an
+            // aggregate was still private. Do not resume a VOD past that data.
+            if !task.is_dynamic && !matches!(&result, Ok(Ok(()))) {
+                task.discard_incomplete_vod();
+            }
+            if task.is_paused() {
+                let auto = task.is_on_demand_auto_paused();
+                if auto && task.is_dynamic {
+                    task.hls.clear_live_segments_keep_sequence();
+                    task.subtitles.clear_live_segments_keep_sequence();
+                }
+                task.set_stage(if auto {
+                    "按需空闲暂停"
+                } else {
+                    "已暂停"
+                });
+                task.set_state(TaskState::Paused);
+                if auto && task.playback_idle_secs() < task.idle_timeout_secs {
+                    self.spawn_locked(&mut slot, "按需请求唤醒");
+                }
+            } else {
+                task.set_stage("已停止");
+                task.set_state(TaskState::Stopped);
+            }
+            return;
         }
-        self.spawn_on_demand_idle_watcher(id.to_string());
+        match result {
+            Ok(Ok(())) => {
+                task.hls
+                    .finish_pair(task.subtitles_enabled.then_some(&task.subtitles));
+                task.set_stage("已完成");
+                task.set_state(TaskState::Finished);
+            }
+            result => {
+                let error = match result {
+                    Ok(Err(e)) => format!("{e:#}"),
+                    Err(e) => format!("pipeline worker terminated: {e}"),
+                    Ok(Ok(())) => unreachable!(),
+                };
+                tracing::error!(task = %task.id, %error, "pipeline failed");
+                if !task.is_dynamic {
+                    task.discard_incomplete_vod();
+                }
+                *task.error_msg.lock() = error;
+                task.set_stage("出错");
+                task.set_state(TaskState::Error);
+            }
+        }
     }
 
     pub fn mark_playback_request(&self, id: &str) -> Option<Arc<Task>> {
-        let task = self.get(id)?;
+        let mut slot = self.tasks.get_mut(id)?;
+        let task = slot.task.clone();
         task.mark_playback_request();
-        self.start_on_demand_if_needed(task.clone());
-        Some(task)
-    }
-
-    fn start_on_demand_if_needed(&self, task: Arc<Task>) {
-        if !task.run_mode.is_on_demand() {
-            return;
-        }
-        if !matches!(task.state(), TaskState::Paused | TaskState::Stopped) {
-            return;
-        }
-        if task
-            .on_demand_auto_paused
-            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+        if !slot.running
+            && task.run_mode.is_on_demand()
+            && task.is_on_demand_auto_paused()
+            && matches!(task.state(), TaskState::Paused | TaskState::Stopped)
         {
-            return;
+            self.spawn_locked(&mut slot, "按需请求唤醒");
         }
-        tracing::info!(task = %task.id, "on-demand playback request woke task");
-        self.spawn_task_pipeline(task, "按需请求唤醒");
+        Some(task)
     }
 
     fn spawn_on_demand_idle_watcher(&self, id: String) {
@@ -343,16 +460,11 @@ impl TaskManager {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(ON_DEMAND_IDLE_CHECK_SECS)).await;
-                let Some(task) = mgr.get(&id) else {
+                let Some(slot) = mgr.tasks.get_mut(&id) else {
                     break;
                 };
-                if !task.run_mode.is_on_demand() {
-                    break;
-                }
-                if matches!(task.state(), TaskState::Finished | TaskState::Error) {
-                    break;
-                }
-                if !matches!(task.state(), TaskState::Running | TaskState::Parsing) {
+                let task = &slot.task;
+                if !slot.running || task.cancel_token().is_cancelled() {
                     continue;
                 }
                 let idle_secs = task.playback_idle_secs();
@@ -361,66 +473,62 @@ impl TaskManager {
                 }
                 task.on_demand_auto_paused.store(true, Ordering::Relaxed);
                 task.set_paused(true);
-                task.set_stage("按需空闲暂停");
+                task.set_stage("正在按需暂停");
                 task.cancel.lock().cancel();
-                if task.is_dynamic {
-                    task.hls.clear_live_segments_keep_sequence();
-                    task.subtitles.clear_live_segments_keep_sequence();
-                }
-                tracing::info!(
-                    task = %task.id,
-                    idle_secs,
-                    idle_timeout_secs = task.idle_timeout_secs,
-                    "auto-stopping idle on-demand session"
-                );
+                tracing::info!(task = %task.id, idle_secs, "stopping idle on-demand session");
             }
         });
     }
 
-    /// 停止任务：取消流水线，保留已产段（可重新启动）。
-    pub fn stop(&self, id: &str) -> bool {
-        if let Some(t) = self.get(id) {
-            t.set_paused(false);
-            t.on_demand_auto_paused.store(false, Ordering::Relaxed);
-            t.cancel.lock().cancel();
-            true
-        } else {
-            false
+    /// Returns None for an unknown task, or whether the worker is still exiting.
+    pub fn stop(&self, id: &str) -> Option<bool> {
+        let slot = self.tasks.get_mut(id)?;
+        slot.task.set_paused(false);
+        slot.task
+            .on_demand_auto_paused
+            .store(false, Ordering::Relaxed);
+        if slot.running {
+            slot.task.set_stage("正在停止");
+            slot.task.cancel.lock().cancel();
+        } else if slot.task.state() != TaskState::Finished {
+            slot.task.set_stage("已停止");
+            slot.task.set_state(TaskState::Stopped);
         }
+        Some(slot.running)
     }
 
-    /// 暂停任务：取消流水线但标记 paused，保留进度（可恢复）。
     pub fn pause(&self, id: &str) -> bool {
-        if let Some(t) = self.get(id) {
-            if matches!(t.state(), TaskState::Running | TaskState::Parsing) {
-                t.set_paused(true);
-                t.on_demand_auto_paused.store(false, Ordering::Relaxed);
-                t.cancel.lock().cancel();
-                return true;
-            }
+        let Some(slot) = self.tasks.get_mut(id) else {
+            return false;
+        };
+        if !slot.running || slot.task.cancel_token().is_cancelled() {
+            return false;
         }
-        false
+        slot.task.set_paused(true);
+        slot.task
+            .on_demand_auto_paused
+            .store(false, Ordering::Relaxed);
+        slot.task.set_stage("正在暂停");
+        slot.task.cancel.lock().cancel();
+        true
     }
 
-    /// 启动/恢复任务：换新取消令牌并重新 spawn 流水线，从 resume_number 继续。
     pub fn start(&self, id: &str) -> bool {
-        if let Some(t) = self.get(id) {
-            // 仅当未在运行时才启动
-            if matches!(t.state(), TaskState::Running | TaskState::Parsing) {
-                return false;
-            }
-            self.spawn_task_pipeline(t, "恢复中");
-            true
-        } else {
-            false
+        let Some(mut slot) = self.tasks.get_mut(id) else {
+            return false;
+        };
+        if slot.running || slot.task.state() == TaskState::Finished {
+            return false;
         }
+        self.spawn_locked(&mut slot, "恢复中");
+        true
     }
 
     pub fn list(&self) -> Vec<TaskStatus> {
         self.tasks
             .iter()
             .map(|e| {
-                let t = e.value();
+                let t = &e.value().task;
                 TaskStatus {
                     id: t.id.clone(),
                     name: t.name.clone(),
@@ -439,7 +547,7 @@ impl TaskManager {
                     resolution: format!("{}x{}", t.width, t.height),
                     segments_done: t.segments_done.load(Ordering::Relaxed),
                     total_segments: t.total_segments.load(Ordering::Relaxed),
-                    segments_available: t.hls.segment_count(),
+                    segments_available: t.hls.published_segment_count(),
                     mb_done: t.bytes_done.load(Ordering::Relaxed) as f64 / 1_048_576.0,
                     error: t.error_msg.lock().clone(),
                     playlist_url: format!("/p/{}", t.id),
@@ -479,5 +587,131 @@ pub mod parking_lot_lite {
         pub fn lock(&self) -> std::sync::MutexGuard<'_, T> {
             self.0.lock().unwrap()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(id: &str, url: String) -> Arc<Task> {
+        let sel = TrackSelection {
+            mpd_url: url.clone(),
+            source_kind: SourceKind::Hls,
+            keys: String::new(),
+            key_mode: KeyMode::Clear,
+            video_rep_id: "hls-0".into(),
+            audio_rep_id: None,
+            enable_subtitles: false,
+            subtitle_rep_id: None,
+        };
+        Arc::new(Task {
+            id: id.into(),
+            name: id.into(),
+            run_mode: RunMode::OnDemand,
+            mpd_url: url,
+            video_rep_id: sel.video_rep_id.clone(),
+            audio_rep_id: None,
+            subtitles_enabled: false,
+            subtitle_rep_id: None,
+            subtitle_lang: String::new(),
+            source_kind: SourceKind::Hls,
+            codecs: "avc1".into(),
+            width: 128,
+            height: 72,
+            bandwidth: 1000,
+            is_dynamic: true,
+            state: AtomicU8::new(0),
+            error_msg: parking_lot_lite::Mutex::new(String::new()),
+            stage: parking_lot_lite::Mutex::new(String::new()),
+            segments_done: AtomicU64::new(0),
+            bytes_done: AtomicU64::new(0),
+            total_segments: AtomicU64::new(0),
+            resume_number: AtomicU64::new(0),
+            acc_v_dts: AtomicU64::new(0),
+            acc_a_dts: AtomicU64::new(0),
+            origin_v_tfdt: AtomicU64::new(u64::MAX),
+            origin_a_tfdt: AtomicU64::new(u64::MAX),
+            hls: Arc::new(HlsOutput::new(
+                6,
+                4,
+                "avc1".into(),
+                "SDR".into(),
+                true,
+                "/p/test".into(),
+                1,
+            )),
+            subtitles: Arc::new(SubtitleOutput::new(6, 4, true, 1)),
+            fetch_tuning: AdaptiveFetchTuning::new(),
+            cancel: parking_lot_lite::Mutex::new(CancellationToken::new()),
+            paused: AtomicBool::new(false),
+            last_playback_request_secs: AtomicU64::new(0),
+            idle_timeout_secs: 300,
+            on_demand_auto_paused: AtomicBool::new(false),
+            sel,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_start_and_play_requests_do_not_replace_worker() {
+        // A local listener that doesn't serve the manifest holds the first
+        // worker during the race. No external endpoint or account is needed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/live.m3u8", listener.local_addr().unwrap());
+        let mgr = TaskManager::new(Arc::new(crate::fetch::Downloader::new()));
+        let task = fixture("race", url);
+        mgr.add_task(task.clone());
+        let barrier = Arc::new(tokio::sync::Barrier::new(17));
+        let mut calls = Vec::new();
+        for _ in 0..16 {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            calls.push(tokio::spawn(async move {
+                barrier.wait().await;
+                mgr.start("race")
+            }));
+        }
+        barrier.wait().await;
+        let mut accepted = 0;
+        for call in calls {
+            accepted += usize::from(call.await.unwrap());
+        }
+        assert_eq!(accepted, 1);
+        let token = task.cancel_token();
+        for _ in 0..8 {
+            assert!(mgr.mark_playback_request("race").is_some());
+            assert!(!mgr.start("race"));
+        }
+        assert!(mgr.pause("race"));
+        assert!(token.is_cancelled());
+        // No replacement until the active worker has fully exited.
+        assert!(!mgr.start("race"));
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while task.state() != TaskState::Paused {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(mgr.start("race"));
+        assert!(!task.cancel_token().is_cancelled());
+        mgr.remove("race");
+    }
+
+    #[tokio::test]
+    async fn worker_panic_is_reflected_in_task_state() {
+        let mgr = TaskManager::new(Arc::new(crate::fetch::Downloader::new()));
+        let task = fixture("panic", "http://127.0.0.1:1/local".into());
+        mgr.add_task(task.clone());
+        {
+            let mut slot = mgr.tasks.get_mut("panic").unwrap();
+            slot.running = true;
+            task.set_state(TaskState::Running);
+        }
+        let failure = tokio::spawn(async { panic!("synthetic worker test") }).await;
+        mgr.worker_finished("panic", failure, false);
+        assert_eq!(task.state(), TaskState::Error);
+        assert!(task.error_msg.lock().contains("pipeline worker terminated"));
+        assert!(!mgr.tasks.get("panic").unwrap().running);
     }
 }

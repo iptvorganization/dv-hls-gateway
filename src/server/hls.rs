@@ -21,14 +21,39 @@ const ON_DEMAND_INITIAL_WAIT_STEP_MS: u64 = 200;
 
 fn host_prefix(headers: &HeaderMap) -> String {
     let host = headers
-        .get("host")
+        .get(header::HOST)
         .and_then(|v| v.to_str().ok())
+        .filter(|host| !host.contains('@') && host.parse::<axum::http::uri::Authority>().is_ok())
         .unwrap_or("localhost");
-    let scheme = headers
+    let scheme = if headers
         .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
+        .is_some_and(|value| value == "https")
+    {
+        "https"
+    } else {
+        "http"
+    };
     format!("{scheme}://{host}")
+}
+
+fn playlist_prefix(base: Option<&str>, headers: &HeaderMap, id: &str) -> Option<String> {
+    let Some(base) = base else {
+        return Some(format!("{}/p/{id}", host_prefix(headers)));
+    };
+    if base.chars().any(char::is_control) {
+        return None;
+    }
+    let base = url::Url::parse(base).ok()?;
+    if !matches!(base.scheme(), "http" | "https")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return None;
+    }
+    Some(base.as_str().trim_end_matches('/').to_owned())
 }
 
 #[derive(Deserialize)]
@@ -45,14 +70,11 @@ pub async fn master(
 ) -> impl IntoResponse {
     match st.mgr.mark_playback_request(&id) {
         Some(t) => {
-            wait_for_on_demand_initial_output(&t).await;
-            let prefix = match &q.url {
-                // 从 ?url=https://cdn.example.com/p/<id> 提取前缀（去掉尾部 playlist id 本身，保留 /p/<id> 路径）
-                Some(u) => {
-                    let u = u.trim_end_matches('/');
-                    u.to_string()
-                }
-                None => format!("{}/p/{id}", host_prefix(&headers)),
+            if !wait_for_on_demand_initial_output(&t, false).await {
+                return not_ready();
+            }
+            let Some(prefix) = playlist_prefix(q.url.as_deref(), &headers, &id) else {
+                return (StatusCode::BAD_REQUEST, "invalid playlist URL prefix").into_response();
             };
             let body = if t.subtitles_enabled {
                 t.hls.master_playlist_absolute(
@@ -97,10 +119,11 @@ pub async fn media(
 ) -> impl IntoResponse {
     match st.mgr.mark_playback_request(&id) {
         Some(t) => {
-            wait_for_on_demand_initial_output(&t).await;
-            let prefix = match &q.url {
-                Some(u) => u.trim_end_matches('/').to_string(),
-                None => format!("{}/p/{id}", host_prefix(&headers)),
+            if !wait_for_on_demand_initial_output(&t, false).await {
+                return not_ready();
+            }
+            let Some(prefix) = playlist_prefix(q.url.as_deref(), &headers, &id) else {
+                return (StatusCode::BAD_REQUEST, "invalid playlist URL prefix").into_response();
             };
             let body = t.hls.media_playlist_absolute(&prefix);
             (
@@ -124,10 +147,11 @@ pub async fn subtitles(
 ) -> impl IntoResponse {
     match st.mgr.mark_playback_request(&id) {
         Some(t) if t.subtitles_enabled => {
-            wait_for_on_demand_initial_output(&t).await;
-            let prefix = match &q.url {
-                Some(u) => u.trim_end_matches('/').to_string(),
-                None => format!("{}/p/{id}", host_prefix(&headers)),
+            if !wait_for_on_demand_initial_output(&t, true).await {
+                return not_ready();
+            }
+            let Some(prefix) = playlist_prefix(q.url.as_deref(), &headers, &id) else {
+                return (StatusCode::BAD_REQUEST, "invalid playlist URL prefix").into_response();
             };
             let body = t.subtitles.playlist_absolute(&prefix);
             (
@@ -144,25 +168,45 @@ pub async fn subtitles(
     }
 }
 
-async fn wait_for_on_demand_initial_output(t: &crate::task::manager::Task) {
-    if !t.run_mode.is_on_demand() || t.hls.segment_count() > 0 {
-        return;
+fn not_ready() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::RETRY_AFTER, "1"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        "playlist is not ready",
+    )
+        .into_response()
+}
+
+async fn wait_for_on_demand_initial_output(t: &crate::task::manager::Task, subtitle: bool) -> bool {
+    if t.state() == TaskState::Error {
+        return false;
     }
-    if !matches!(t.state(), TaskState::Running | TaskState::Parsing) {
-        return;
+    if !t.run_mode.is_on_demand() {
+        return true;
     }
-    let mut waited = 0;
-    while waited < ON_DEMAND_INITIAL_WAIT_MS {
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_millis(ON_DEMAND_INITIAL_WAIT_MS);
+    loop {
+        let published = if subtitle {
+            t.subtitles.published_segment_count()
+        } else {
+            t.hls.published_segment_count()
+        };
+        if published > 0 {
+            return true;
+        }
+        if !matches!(t.state(), TaskState::Running | TaskState::Parsing)
+            || tokio::time::Instant::now() >= deadline
+        {
+            return false;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(
             ON_DEMAND_INITIAL_WAIT_STEP_MS,
         ))
         .await;
-        waited += ON_DEMAND_INITIAL_WAIT_STEP_MS;
-        if t.hls.segment_count() > 0
-            || !matches!(t.state(), TaskState::Running | TaskState::Parsing)
-        {
-            break;
-        }
     }
 }
 
@@ -189,10 +233,12 @@ pub async fn segment(State(st): State<Arc<AppState>>, Path(p): Path<SegPath>) ->
             Some(data) => ([(header::CONTENT_TYPE, JPEG_CT)], data).into_response(),
             None => (StatusCode::NOT_FOUND, "gone").into_response(),
         },
-        (Some(t), _, Some(seq)) if t.subtitles_enabled => match t.subtitles.get_segment(seq) {
-            Some(data) => ([(header::CONTENT_TYPE, TXT_CT)], data).into_response(),
-            None => (StatusCode::NOT_FOUND, "gone").into_response(),
-        },
+        (Some(t), _, Some(seq)) if t.subtitles_enabled => {
+            match t.subtitles.get_segment_bytes(seq) {
+                Some(data) => ([(header::CONTENT_TYPE, TXT_CT)], data).into_response(),
+                None => (StatusCode::NOT_FOUND, "gone").into_response(),
+            }
+        }
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }

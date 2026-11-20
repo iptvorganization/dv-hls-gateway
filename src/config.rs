@@ -1,7 +1,10 @@
 //! Runtime configuration loaded from a JSON file next to the binary.
 
-use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +40,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
             port: 37201,
         }
     }
@@ -145,6 +148,14 @@ pub fn load_from_path(path: &Path) -> crate::Result<Option<AppConfig>> {
     }
     let config: AppConfig = serde_json::from_value(value)
         .map_err(|e| anyhow::anyhow!("parse config {}: {e}", path.display()))?;
+    anyhow::ensure!(
+        !config
+            .auth
+            .effective_key()
+            .eq_ignore_ascii_case("change-me"),
+        "replace the example auth.key or remove it to generate a random key ({})",
+        path.display()
+    );
     if wrote_migration {
         write_config(path, &config)?;
     }
@@ -156,9 +167,27 @@ pub fn write_template(path: &Path, config: &AppConfig) -> crate::Result<()> {
 }
 
 fn write_config(path: &Path, config: &AppConfig) -> crate::Result<()> {
-    let text = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, format!("{text}\n"))
-        .map_err(|e| anyhow::anyhow!("write config template {}: {e}", path.display()))
+    let temporary = path.with_file_name(format!(".dvhls-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = (|| -> crate::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut out = options.open(&temporary)?;
+        serde_json::to_writer_pretty(&mut out, config)?;
+        out.write_all(b"\n")?;
+        out.sync_all()?;
+        drop(out);
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result.map_err(|e| anyhow::anyhow!("write config template {}: {e}", path.display()))
 }
 
 fn generate_auth_key() -> String {
@@ -172,7 +201,7 @@ mod tests {
     #[test]
     fn config_defaults_keep_server_port_but_leave_key_api_unset() {
         let config = AppConfig::default();
-        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 37201);
         assert!(config.auth.key.starts_with("dvhls-"));
         assert!(config.key_api.url.is_empty());
@@ -190,7 +219,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 38080);
         assert_eq!(config.auth.effective_key(), "panel-secret");
         assert_eq!(
@@ -212,9 +241,26 @@ mod tests {
         config.auth.key = "panel-secret".to_string();
 
         write_template(&path, &config).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let loaded = load_from_path(&path).unwrap().unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.auth.effective_key(), "panel-secret");
+    }
+
+    #[test]
+    fn placeholder_auth_key_is_not_accepted() {
+        let path = std::env::temp_dir().join(format!("dvhls-test-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, r#"{"auth":{"key":" CHANGE-ME "}}"#).unwrap();
+        let result = load_from_path(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(result.unwrap_err().to_string().contains("example auth.key"));
     }
 }

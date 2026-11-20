@@ -3,20 +3,26 @@
 use std::{
     collections::HashMap,
     env, fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
 use anyhow::Context;
-use reqwest::{Client, StatusCode};
-use tokio::sync::Semaphore;
+use reqwest::{Client, Response, StatusCode};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// 共享 HTTP 客户端。
 #[derive(Clone)]
 pub struct Downloader {
     client: Client,
     shared_downloads: Arc<Semaphore>,
-    host_downloads: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    host_downloads: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
+}
+
+/// Manifest body together with the response URL after HTTP redirects.
+pub struct FetchedManifest {
+    pub text: String,
+    pub url: String,
 }
 
 const SHARED_DOWNLOAD_CONCURRENCY: usize = 10;
@@ -25,6 +31,9 @@ const MEDIA_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(12);
 const TEXT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ATTEMPTS: usize = 3;
 const MAX_403_RETRIES: usize = 3;
+const MAX_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MEDIA_BYTES: usize = 128 * 1024 * 1024;
+const MAX_ERROR_PREVIEW_BYTES: usize = 1024;
 
 impl Downloader {
     pub fn new() -> Self {
@@ -42,23 +51,35 @@ impl Downloader {
 
     /// 下载一个 URL 的全部字节。
     pub async fn get(&self, url: &str) -> crate::Result<bytes::Bytes> {
-        let _shared = self
+        let _permits = self.acquire(url).await?;
+        self.request_bytes_with_retry(url).await
+    }
+
+    pub async fn get_manifest(&self, url: &str) -> crate::Result<FetchedManifest> {
+        let _permits = self.acquire(url).await?;
+        self.request_text_with_retry(url).await
+    }
+
+    pub async fn get_text(&self, url: &str) -> crate::Result<String> {
+        Ok(self.get_manifest(url).await?.text)
+    }
+
+    async fn acquire(
+        &self,
+        url: &str,
+    ) -> crate::Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let host = self
+            .host_semaphore(url)
+            .acquire_owned()
+            .await
+            .context("per-host download semaphore closed")?;
+        let shared = self
             .shared_downloads
             .clone()
             .acquire_owned()
             .await
             .context("shared download semaphore closed")?;
-        let _host = self
-            .host_semaphore(url)
-            .acquire_owned()
-            .await
-            .context("per-host download semaphore closed")?;
-        self.request_bytes_with_retry(url).await
-    }
-
-    /// 下载 MPD 文本。
-    pub async fn get_text(&self, url: &str) -> crate::Result<String> {
-        self.request_text_with_retry(url).await
+        Ok((host, shared))
     }
 
     fn host_semaphore(&self, url: &str) -> Arc<Semaphore> {
@@ -70,10 +91,13 @@ impl Downloader {
             .host_downloads
             .lock()
             .expect("host limiter mutex poisoned");
-        hosts
-            .entry(host)
-            .or_insert_with(|| Arc::new(Semaphore::new(per_host_download_concurrency())))
-            .clone()
+        if let Some(limit) = hosts.get(&host).and_then(Weak::upgrade) {
+            return limit;
+        }
+        hosts.retain(|_, limit| limit.strong_count() != 0);
+        let limit = Arc::new(Semaphore::new(per_host_download_concurrency()));
+        hosts.insert(host, Arc::downgrade(&limit));
+        limit
     }
 
     async fn request_bytes_with_retry(&self, url: &str) -> crate::Result<bytes::Bytes> {
@@ -86,7 +110,8 @@ impl Downloader {
             match result {
                 Ok(Ok(bytes)) => return Ok(bytes),
                 Ok(Err(err)) => {
-                    let retry = should_retry(err.status, attempt, forbidden_retries);
+                    let retry =
+                        !err.permanent && should_retry(err.status, attempt, forbidden_retries);
                     if err.status == Some(StatusCode::FORBIDDEN) && retry {
                         forbidden_retries += 1;
                     }
@@ -109,7 +134,7 @@ impl Downloader {
         Err(DownloadError::new(url, failure.kind, failure.message).into())
     }
 
-    async fn request_text_with_retry(&self, url: &str) -> crate::Result<String> {
+    async fn request_text_with_retry(&self, url: &str) -> crate::Result<FetchedManifest> {
         let mut last_failure: Option<RequestFailure> = None;
         let mut forbidden_retries = 0usize;
 
@@ -119,7 +144,8 @@ impl Downloader {
             match result {
                 Ok(Ok(text)) => return Ok(text),
                 Ok(Err(err)) => {
-                    let retry = should_retry(err.status, attempt, forbidden_retries);
+                    let retry =
+                        !err.permanent && should_retry(err.status, attempt, forbidden_retries);
                     if err.status == Some(StatusCode::FORBIDDEN) && retry {
                         forbidden_retries += 1;
                     }
@@ -151,13 +177,13 @@ impl Downloader {
             .map_err(RequestFailure::from_reqwest)?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = error_preview(resp).await;
             return Err(RequestFailure::from_status(status, body));
         }
-        resp.bytes().await.map_err(RequestFailure::from_reqwest)
+        read_bounded(resp, MAX_MEDIA_BYTES).await
     }
 
-    async fn request_text_once(&self, url: &str) -> Result<String, RequestFailure> {
+    async fn request_text_once(&self, url: &str) -> Result<FetchedManifest, RequestFailure> {
         let resp = self
             .client
             .get(url)
@@ -166,14 +192,49 @@ impl Downloader {
             .map_err(RequestFailure::from_reqwest)?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = error_preview(resp).await;
             return Err(RequestFailure::from_status(status, body));
         }
-        resp.text().await.map_err(RequestFailure::from_reqwest)
+        let url = resp.url().to_string();
+        let body = read_bounded(resp, MAX_MANIFEST_BYTES).await?;
+        Ok(FetchedManifest {
+            url,
+            text: String::from_utf8_lossy(&body).into_owned(),
+        })
     }
 }
 
+async fn read_bounded(mut resp: Response, limit: usize) -> Result<bytes::Bytes, RequestFailure> {
+    if resp
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return Err(RequestFailure::too_large(limit));
+    }
+    let mut body = bytes::BytesMut::new();
+    while let Some(chunk) = resp.chunk().await.map_err(RequestFailure::from_reqwest)? {
+        if chunk.len() > limit - body.len() {
+            return Err(RequestFailure::too_large(limit));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+async fn error_preview(mut resp: Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_PREVIEW_BYTES {
+        let Ok(Some(chunk)) = resp.chunk().await else {
+            break;
+        };
+        let n = (MAX_ERROR_PREVIEW_BYTES - body.len()).min(chunk.len());
+        body.extend_from_slice(&chunk[..n]);
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 struct RequestFailure {
+    permanent: bool,
     status: Option<StatusCode>,
     kind: DownloadFailureKind,
     message: String,
@@ -183,6 +244,7 @@ impl RequestFailure {
     fn from_reqwest(err: reqwest::Error) -> Self {
         let message = err.to_string();
         Self {
+            permanent: false,
             status: err.status(),
             kind: DownloadFailureKind::from_reqwest(&err, &message),
             message,
@@ -197,6 +259,7 @@ impl RequestFailure {
             format!("upstream returned status {status}: {preview}")
         };
         Self {
+            permanent: false,
             status: Some(status),
             kind: DownloadFailureKind::HttpStatus(status),
             message,
@@ -205,6 +268,7 @@ impl RequestFailure {
 
     fn timeout(timeout: Duration) -> Self {
         Self {
+            permanent: false,
             status: None,
             kind: DownloadFailureKind::Timeout,
             message: format!("timed out after {}s", timeout.as_secs()),
@@ -213,9 +277,17 @@ impl RequestFailure {
 
     fn other(message: impl Into<String>) -> Self {
         Self {
+            permanent: false,
             status: None,
             kind: DownloadFailureKind::Other,
             message: message.into(),
+        }
+    }
+
+    fn too_large(limit: usize) -> Self {
+        Self {
+            permanent: true,
+            ..Self::other(format!("response exceeds the {limit}-byte download limit"))
         }
     }
 }
@@ -387,5 +459,42 @@ mod tests {
             !DownloadFailureKind::HttpStatus(StatusCode::INTERNAL_SERVER_ERROR)
                 .is_concurrency_pressure()
         );
+    }
+
+    #[tokio::test]
+    async fn manifest_reports_effective_url_and_streamed_bodies_are_bounded() {
+        use axum::{body::Body, response::Redirect, routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route(
+                "/entry",
+                get(|| async { Redirect::temporary("/variant/index.m3u8") }),
+            )
+            .route(
+                "/variant/index.m3u8",
+                get(|| async { "#EXTM3U\nclip.ts\n" }),
+            )
+            .route(
+                "/tiny",
+                get(|| async {
+                    Body::from_stream(futures::stream::iter([
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"ABC")),
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"DEF")),
+                    ]))
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dl = Downloader::new();
+        let manifest = dl.get_manifest(&format!("{base}/entry")).await.unwrap();
+        assert_eq!(manifest.url, format!("{base}/variant/index.m3u8"));
+        assert!(manifest.text.contains("clip.ts"));
+        let response = dl.client.get(format!("{base}/tiny")).send().await.unwrap();
+        assert!(response.content_length().is_none());
+        let failure = read_bounded(response, 5).await.err().unwrap();
+        assert!(failure.permanent && failure.message.contains("5-byte download limit"));
+        server.abort();
     }
 }

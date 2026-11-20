@@ -28,14 +28,37 @@ impl SubtitleAccumulator {
         decryptor: Option<&Decryptor>,
         default_iv_size: Option<u8>,
     ) -> crate::Result<()> {
-        let cues = fragment_to_vtt_body(
-            data,
-            self.duration,
-            duration,
-            timescale,
-            decryptor,
-            default_iv_size,
-        )?;
+        self.append_fragment_at(data, duration, timescale, decryptor, default_iv_size, None)
+    }
+
+    /// For TS pass-through, resolve the source VTT clock against this input
+    /// video fragment before rebasing the cues to the output segment clock.
+    pub fn append_fragment_at(
+        &mut self,
+        data: &[u8],
+        duration: f64,
+        timescale: u32,
+        decryptor: Option<&Decryptor>,
+        default_iv_size: Option<u8>,
+        video_pts_90k: Option<u64>,
+    ) -> crate::Result<()> {
+        let raw_vtt = video_pts_90k.and_then(|pts| {
+            let text = std::str::from_utf8(data).ok()?;
+            let text = text.trim_start_matches('\u{feff}').trim_start();
+            text.starts_with("WEBVTT")
+                .then(|| mapped_webvtt_to_body(text, self.duration, duration, pts))
+        });
+        let cues = match raw_vtt {
+            Some(cues) => cues?,
+            None => fragment_to_vtt_body(
+                data,
+                self.duration,
+                duration,
+                timescale,
+                decryptor,
+                default_iv_size,
+            )?,
+        };
         append_body(&mut self.body, &cues);
         self.duration += duration.max(0.0);
         Ok(())
@@ -179,6 +202,10 @@ struct Cue {
 }
 
 fn webvtt_to_body(text: &str, offset_secs: f64, default_duration_secs: f64) -> String {
+    normalize_and_format_cues(parse_webvtt_cues(text), offset_secs, default_duration_secs)
+}
+
+fn parse_webvtt_cues(text: &str) -> Vec<Cue> {
     let mut cues = Vec::new();
     for block in split_blocks(text) {
         let lines: Vec<&str> = block.lines().map(str::trim_end).collect();
@@ -215,7 +242,47 @@ fn webvtt_to_body(text: &str, offset_secs: f64, default_duration_secs: f64) -> S
         });
     }
 
-    normalize_and_format_cues(cues, offset_secs, default_duration_secs)
+    cues
+}
+
+fn mapped_webvtt_to_body(
+    text: &str,
+    offset_secs: f64,
+    duration: f64,
+    video_pts: u64,
+) -> crate::Result<String> {
+    let map = text
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .find_map(|line| line.trim().strip_prefix("X-TIMESTAMP-MAP="));
+    let (local, pts) = if let Some(map) = map {
+        let mut local = None;
+        let mut pts = None;
+        for attr in map.split(',') {
+            let attr = attr.trim();
+            if let Some(v) = attr.strip_prefix("LOCAL:") {
+                local = parse_time_expression(v);
+            } else if let Some(v) = attr.strip_prefix("MPEGTS:") {
+                pts = v.parse::<u64>().ok();
+            }
+        }
+        local
+            .zip(pts)
+            .ok_or_else(|| anyhow::anyhow!("invalid WebVTT X-TIMESTAMP-MAP"))?
+    } else {
+        (0.0, 0)
+    };
+    let modulus = crate::clock::PTS_MODULO;
+    let wrapped_delta = (pts % modulus + modulus - video_pts % modulus) % modulus;
+    let delta = if wrapped_delta > modulus / 2 {
+        wrapped_delta as i64 - modulus as i64
+    } else {
+        wrapped_delta as i64
+    };
+    let shift = delta as f64 / 90_000.0 - local;
+    let mut cues = parse_webvtt_cues(text);
+    cues.retain(|cue| cue.end + shift > 0.0 && cue.start + shift < duration);
+    Ok(format_cues(cues, offset_secs + shift))
 }
 
 fn ttml_to_body(text: &str, offset_secs: f64, default_duration_secs: f64) -> String {
@@ -301,7 +368,7 @@ fn ttml_to_body(text: &str, offset_secs: f64, default_duration_secs: f64) -> Str
 }
 
 fn normalize_and_format_cues(
-    mut cues: Vec<Cue>,
+    cues: Vec<Cue>,
     offset_secs: f64,
     default_duration_secs: f64,
 ) -> String {
@@ -318,10 +385,14 @@ fn normalize_and_format_cues(
         0.0
     };
 
+    format_cues(cues, offset_secs - normalize)
+}
+
+fn format_cues(mut cues: Vec<Cue>, shift: f64) -> String {
     let mut out = String::new();
-    for cue in cues.iter_mut() {
-        cue.start = (cue.start - normalize + offset_secs).max(0.0);
-        cue.end = (cue.end - normalize + offset_secs).max(cue.start + 0.001);
+    for cue in &mut cues {
+        cue.start = (cue.start + shift).max(0.0);
+        cue.end = (cue.end + shift).max(cue.start + 0.001);
         if !out.is_empty() {
             out.push('\n');
         }
@@ -454,6 +525,22 @@ mod tests {
     fn webvtt_body_offsets_cues() {
         let body = webvtt_to_body("WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n", 4.0, 2.0);
         assert!(body.contains("00:00:05.000 --> 00:00:06.000"));
+    }
+
+    #[test]
+    fn webvtt_map_uses_video_pts_and_survives_clock_wrap() {
+        let mut acc = SubtitleAccumulator::new();
+        let before_wrap = crate::clock::PTS_MODULO - 90_000;
+        let vtt = b"WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:20.000,MPEGTS:0\n\n00:00:20.250 --> 00:00:20.750\nfirst\n";
+        acc.append_fragment_at(vtt, 4.0, 1000, None, None, Some(before_wrap))
+            .unwrap();
+        assert!(acc.take_body().contains("00:00:01.250 --> 00:00:01.750"));
+
+        let vtt = b"WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:450000,LOCAL:00:00:27.000\n\n00:00:27.500 --> 00:00:28.000\nsecond\n";
+        acc.append_empty(4.0);
+        acc.append_fragment_at(vtt, 4.0, 1000, None, None, Some(450_000))
+            .unwrap();
+        assert!(acc.take_body().contains("00:00:04.500 --> 00:00:05.000"));
     }
 
     #[test]

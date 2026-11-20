@@ -18,49 +18,60 @@ impl<'a> BoxView<'a> {
 
 /// 遍历 `data` 顶层的所有 box，对每个调用 `f`。
 pub fn iter_boxes(data: &[u8]) -> Vec<BoxView<'_>> {
-    let mut out = Vec::new();
-    let mut p = 0;
-    while p + 8 <= data.len() {
-        let mut size =
-            u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize;
-        let typ = [data[p + 4], data[p + 5], data[p + 6], data[p + 7]];
-        let mut hdr = 8;
-        if size == 1 {
-            if p + 16 > data.len() {
-                break;
-            }
-            size = u64::from_be_bytes([
-                data[p + 8],
-                data[p + 9],
-                data[p + 10],
-                data[p + 11],
-                data[p + 12],
-                data[p + 13],
-                data[p + 14],
-                data[p + 15],
-            ]) as usize;
-            hdr = 16;
+    checked_boxes(data)
+        .map_while(|item| item.map(|b| b.view))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocatedBox<'a> {
+    pub view: BoxView<'a>,
+    pub start: usize,
+    /// The whole box, including its standard or extended header.
+    pub whole: &'a [u8],
+}
+
+/// Like `iter_boxes`, but exposes offsets and produces `None` for a truncated or
+/// invalid last box rather than silently accepting a partial stream.
+pub(crate) fn checked_boxes(mut data: &[u8]) -> impl Iterator<Item = Option<LocatedBox<'_>>> {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if data.is_empty() {
+            return None;
         }
-        if size < hdr || p + size > data.len() {
-            // size==0 表示到文件末尾
-            if size == 0 {
-                let payload = &data[p + hdr..];
-                out.push(BoxView {
-                    typ,
-                    payload,
-                    total_size: data.len() - p,
-                });
-            }
-            break;
+        let item = read_box(data, start);
+        if let Some(b) = item {
+            data = &data[b.whole.len()..];
+            start += b.whole.len();
+        } else {
+            data = &[];
         }
-        out.push(BoxView {
+        Some(item)
+    })
+}
+
+fn read_box(data: &[u8], start: usize) -> Option<LocatedBox<'_>> {
+    let size = u32::from_be_bytes(data.get(..4)?.try_into().ok()?);
+    let typ = data.get(4..8)?.try_into().ok()?;
+    let (size, header) = match size {
+        0 => (data.len(), 8),
+        1 => (
+            usize::try_from(u64::from_be_bytes(data.get(8..16)?.try_into().ok()?)).ok()?,
+            16,
+        ),
+        _ => (size as usize, 8),
+    };
+    let whole = data.get(..size)?;
+    let payload = whole.get(header..)?;
+    Some(LocatedBox {
+        view: BoxView {
             typ,
-            payload: &data[p + hdr..p + size],
+            payload,
             total_size: size,
-        });
-        p += size;
-    }
-    out
+        },
+        start,
+        whole,
+    })
 }
 
 /// 在 `data` 中深度优先查找第一个指定类型的 box，返回其 payload。
@@ -70,12 +81,22 @@ pub fn find_box<'a>(
     target: &[u8; 4],
     container_types: &[&[u8; 4]],
 ) -> Option<&'a [u8]> {
-    for b in iter_boxes(data) {
+    find_box_with_limit(data, target, container_types, 16)
+}
+
+fn find_box_with_limit<'a>(
+    data: &'a [u8],
+    target: &[u8; 4],
+    container_types: &[&[u8; 4]],
+    depth: u8,
+) -> Option<&'a [u8]> {
+    for b in checked_boxes(data).map_while(|b| b.map(|b| b.view)) {
         if &b.typ == target {
             return Some(b.payload);
         }
-        if container_types.contains(&&b.typ) {
-            if let Some(found) = find_box(b.payload, target, container_types) {
+        if depth > 0 && container_types.contains(&&b.typ) {
+            if let Some(found) = find_box_with_limit(b.payload, target, container_types, depth - 1)
+            {
                 return Some(found);
             }
         }

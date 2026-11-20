@@ -1,4 +1,4 @@
-//! MPEG-TS muxer：把已解密的 HEVC(DV) + AC-3/EC-3/AAC 访问单元封装成 188 字节 TS 包。
+//! MPEG-TS muxer：把视频和 AC-3/EC-3/AC-4/AAC 访问单元封装成 188 字节 TS 包。
 
 pub mod bitwriter;
 pub mod crc32;
@@ -25,10 +25,13 @@ pub const STREAM_TYPE_H264: u8 = 0x1B;
 pub const STREAM_TYPE_AC3: u8 = 0x81;
 pub const STREAM_TYPE_EC3: u8 = 0x87;
 pub const STREAM_TYPE_AAC_ADTS: u8 = 0x0F;
+// ETSI TS 103 190-2 Annex D: AC-4 is private PES with an ES-level descriptor.
+pub const STREAM_TYPE_AC4: u8 = 0x06;
 
 // PES stream_id
 pub const STREAM_ID_VIDEO: u8 = 0xE0;
 pub const STREAM_ID_AUDIO: u8 = 0xC0;
+pub const STREAM_ID_PRIVATE_1: u8 = 0xBD;
 
 /// 视频编码类型（决定 PMT stream_type 与 NAL 处理）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +84,7 @@ impl VideoRange {
 pub enum AudioCodec {
     Ac3,
     Ec3,
+    Ac4,
     AacAdts,
 }
 
@@ -89,7 +93,15 @@ impl AudioCodec {
         match self {
             AudioCodec::Ac3 => STREAM_TYPE_AC3,
             AudioCodec::Ec3 => STREAM_TYPE_EC3,
+            AudioCodec::Ac4 => STREAM_TYPE_AC4,
             AudioCodec::AacAdts => STREAM_TYPE_AAC_ADTS,
+        }
+    }
+
+    pub fn pes_stream_id(self) -> u8 {
+        match self {
+            AudioCodec::Ac4 => STREAM_ID_PRIVATE_1,
+            _ => STREAM_ID_AUDIO,
         }
     }
 }

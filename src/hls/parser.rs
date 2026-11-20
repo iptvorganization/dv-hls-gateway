@@ -13,6 +13,7 @@ pub struct HlsMaster {
     pub variants: Vec<HlsVariant>,
     pub audio: Vec<HlsRendition>,
     pub subtitles: Vec<HlsRendition>,
+    pub has_session_key: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,7 @@ pub struct HlsRendition {
     pub id: String,
     pub group_id: String,
     pub name: String,
+    /// Empty for an audio rendition carried inside the variant's media.
     pub uri: String,
     pub language: String,
     pub channels: String,
@@ -47,6 +49,12 @@ pub struct HlsMediaPlaylist {
     pub end_list: bool,
     pub has_map: bool,
     pub map_uri: Option<String>,
+    /// Any non-NONE EXT-X-KEY, including keys protecting init maps.
+    pub has_encryption: bool,
+    /// The current pipeline only keeps one init map per playlist.
+    pub has_multiple_maps: bool,
+    /// Whole-resource downloads cannot represent byte-range segments/maps.
+    pub has_byte_ranges: bool,
     pub segments: Vec<HlsSegment>,
 }
 
@@ -63,6 +71,10 @@ pub struct HlsSegment {
     pub duration: f64,
     pub key: HlsSegmentKey,
     pub discontinuity: bool,
+    /// Timeline epoch signaled by the Media Playlist.
+    pub discontinuity_sequence: u64,
+    /// Start in Unix seconds, from PROGRAM-DATE-TIME or inferred within its epoch.
+    pub program_date_time: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +115,7 @@ pub fn parse_playlist(content: &str, playlist_url: &str) -> crate::Result<HlsPla
     let mut subtitles = Vec::new();
     let mut pending_stream_inf: Option<HashMap<String, String>> = None;
     let mut has_stream_inf = false;
+    let mut has_session_key = false;
 
     let mut target_duration = 6u64;
     let mut media_sequence = 0u64;
@@ -110,14 +123,25 @@ pub fn parse_playlist(content: &str, playlist_url: &str) -> crate::Result<HlsPla
     let mut end_list = false;
     let mut has_map = false;
     let mut map_uri = None;
+    let mut last_map_attrs = None;
+    let mut has_multiple_maps = false;
+    let mut has_byte_ranges = false;
+    let mut has_encryption = false;
     let mut pending_extinf: Option<f64> = None;
     let mut current_key = HlsSegmentKey::None;
     let mut pending_discontinuity = false;
+    let mut discontinuity_sequence = 0u64;
+    let mut pending_program_date_time = None;
     let mut segments = Vec::new();
 
     for raw in content.lines() {
         let line = raw.trim();
         if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("#EXT-X-SESSION-KEY:") {
+            has_session_key = true;
             continue;
         }
 
@@ -139,13 +163,17 @@ pub fn parse_playlist(content: &str, playlist_url: &str) -> crate::Result<HlsPla
         if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA:") {
             let attrs = parse_attr_list(rest);
             if attrs.get("TYPE").map(|v| v == "AUDIO").unwrap_or(false) {
-                if let (Some(group_id), Some(uri)) = (attrs.get("GROUP-ID"), attrs.get("URI")) {
+                if let Some(group_id) = attrs.get("GROUP-ID") {
                     let id = format!("hls-a-{}", audio.len());
                     audio.push(HlsRendition {
                         id,
                         group_id: group_id.clone(),
                         name: attrs.get("NAME").cloned().unwrap_or_default(),
-                        uri: resolve_url(playlist_url, uri)?,
+                        uri: attrs
+                            .get("URI")
+                            .map(|uri| resolve_url(playlist_url, uri))
+                            .transpose()?
+                            .unwrap_or_default(),
                         language: attrs.get("LANGUAGE").cloned().unwrap_or_default(),
                         channels: attrs.get("CHANNELS").cloned().unwrap_or_default(),
                         is_default: attrs.get("DEFAULT").map(|v| v == "YES").unwrap_or(false),
@@ -172,28 +200,60 @@ pub fn parse_playlist(content: &str, playlist_url: &str) -> crate::Result<HlsPla
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
-            media_sequence = rest.trim().parse().unwrap_or(0);
+            anyhow::ensure!(
+                segments.is_empty(),
+                "HLS media sequence must precede segments"
+            );
+            media_sequence = rest
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid HLS media sequence"))?;
             next_sequence = media_sequence;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
+            anyhow::ensure!(
+                segments.is_empty() && !pending_discontinuity,
+                "HLS discontinuity sequence must precede discontinuities and segments"
+            );
+            discontinuity_sequence = rest.trim().parse()?;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            pending_program_date_time = parse_program_date_time(rest.trim());
             continue;
         }
         if line.starts_with("#EXT-X-ENDLIST") {
             end_list = true;
             continue;
         }
-        if line.starts_with("#EXT-X-DISCONTINUITY") {
+        if line == "#EXT-X-DISCONTINUITY" {
+            discontinuity_sequence = discontinuity_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("HLS discontinuity sequence overflow"))?;
             pending_discontinuity = true;
+            continue;
+        }
+        if line.starts_with("#EXT-X-BYTERANGE:") {
+            has_byte_ranges = true;
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-MAP:") {
             has_map = true;
             let attrs = parse_attr_list(rest);
+            has_byte_ranges |= attrs.contains_key("BYTERANGE");
+            if last_map_attrs.as_ref().is_some_and(|prev| prev != &attrs) {
+                has_multiple_maps = true;
+            }
             if let Some(uri) = attrs.get("URI") {
                 map_uri = Some(resolve_url(playlist_url, uri)?);
             }
+            last_map_attrs = Some(attrs);
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-KEY:") {
             current_key = parse_key(rest, playlist_url)?;
+            has_encryption |= current_key != HlsSegmentKey::None;
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
@@ -203,7 +263,11 @@ pub fn parse_playlist(content: &str, playlist_url: &str) -> crate::Result<HlsPla
                 .unwrap_or_default()
                 .trim()
                 .parse::<f64>()
-                .unwrap_or(0.0);
+                .ok()
+                .filter(|duration| duration.is_finite() && *duration > 0.0)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("HLS EXTINF duration must be positive and finite")
+                })?;
             pending_extinf = Some(dur);
             continue;
         }
@@ -219,8 +283,12 @@ pub fn parse_playlist(content: &str, playlist_url: &str) -> crate::Result<HlsPla
                 duration,
                 key: current_key.clone(),
                 discontinuity: std::mem::take(&mut pending_discontinuity),
+                discontinuity_sequence,
+                program_date_time: pending_program_date_time.take(),
             });
-            next_sequence += 1;
+            next_sequence = next_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("HLS media sequence cannot be advanced"))?;
         }
     }
 
@@ -229,8 +297,10 @@ pub fn parse_playlist(content: &str, playlist_url: &str) -> crate::Result<HlsPla
             variants,
             audio,
             subtitles,
+            has_session_key,
         }))
     } else {
+        infer_program_dates(&mut segments);
         Ok(HlsPlaylist::Media(HlsMediaPlaylist {
             uri: playlist_url.to_string(),
             target_duration,
@@ -238,8 +308,110 @@ pub fn parse_playlist(content: &str, playlist_url: &str) -> crate::Result<HlsPla
             end_list,
             has_map,
             map_uri,
+            has_encryption: has_encryption || has_session_key,
+            has_multiple_maps,
+            has_byte_ranges,
             segments,
         }))
+    }
+}
+
+fn parse_program_date_time(value: &str) -> Option<f64> {
+    let (date, time) = value.split_once(['T', 't'])?;
+    let (clock, zone_minutes) = if let Some(clock) = time.strip_suffix(['Z', 'z']) {
+        (clock, 0)
+    } else {
+        let i = time.rfind(['+', '-'])?;
+        let sign = if time.as_bytes()[i] == b'-' { -1 } else { 1 };
+        let zone = &time[i + 1..];
+        let (h, m) = zone
+            .split_once(':')
+            .or_else(|| (zone.len() == 4).then_some((zone.get(..2)?, zone.get(2..)?)))?;
+        let h = decimal(h, 2)?;
+        let m = decimal(m, 2)?;
+        if h > 23 || m > 59 {
+            return None;
+        }
+        (&time[..i], sign * (h * 60 + m))
+    };
+    let mut date = date.split('-');
+    let year = decimal(date.next()?, 4)?;
+    let month = decimal(date.next()?, 2)?;
+    let day = decimal(date.next()?, 2)?;
+    if date.next().is_some() || year == 0 || !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_per_month = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1..=days_per_month[month as usize - 1]).contains(&day) {
+        return None;
+    }
+    let before_year = |year: i64| {
+        let y = year - 1;
+        y * 365 + y / 4 - y / 100 + y / 400
+    };
+    let days = before_year(year) - before_year(1970)
+        + days_per_month[..month as usize - 1].iter().sum::<i64>()
+        + day
+        - 1;
+    let mut clock = clock.split(':');
+    let h = decimal(clock.next()?, 2)?;
+    let m = decimal(clock.next()?, 2)?;
+    let seconds = clock.next()?;
+    if clock.next().is_some() || h > 23 || m > 59 {
+        return None;
+    }
+    let (sec, frac) = seconds.split_once('.').unwrap_or((seconds, ""));
+    let sec = decimal(sec, 2)?;
+    if sec > 60 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let fraction = frac
+        .bytes()
+        .take(9)
+        .enumerate()
+        .map(|(i, digit)| f64::from(digit - b'0') * 10f64.powi(-1 - i as i32))
+        .sum::<f64>();
+    Some((days * 86_400 + h * 3600 + m * 60 + sec - zone_minutes * 60) as f64 + fraction)
+}
+
+fn decimal(s: &str, width: usize) -> Option<i64> {
+    (s.len() == width && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
+fn infer_program_dates(segments: &mut [HlsSegment]) {
+    // Do not extrapolate across an explicit epoch break without a new
+    // anchor: media PTS can jump arbitrarily there.
+    for epoch in segments.chunk_by_mut(|a, b| a.discontinuity_sequence == b.discontinuity_sequence)
+    {
+        let Some(first) = epoch.iter().position(|seg| seg.program_date_time.is_some()) else {
+            continue;
+        };
+        let mut next = epoch[first].program_date_time;
+        for seg in epoch[..first].iter_mut().rev() {
+            next = next.map(|ts| ts - seg.duration);
+            seg.program_date_time = next;
+        }
+        let mut next = epoch[first].program_date_time;
+        for seg in &mut epoch[first..] {
+            seg.program_date_time = seg.program_date_time.or(next);
+            next = seg.program_date_time.map(|ts| ts + seg.duration);
+        }
     }
 }
 
@@ -280,7 +452,8 @@ fn parse_key(rest: &str, playlist_url: &str) -> crate::Result<HlsSegmentKey> {
     let method = attrs
         .get("METHOD")
         .map(|s| s.trim().to_ascii_uppercase())
-        .unwrap_or_else(|| "NONE".to_string());
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("HLS EXT-X-KEY is missing METHOD"))?;
     if method == "NONE" {
         return Ok(HlsSegmentKey::None);
     }
@@ -388,6 +561,43 @@ fn resolve_key_uri(base: &str, uri: &str) -> crate::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_date_time_normalizes_zones_and_stays_within_epoch() {
+        assert_eq!(
+            parse_program_date_time("1970-01-01T08:00:00.125+08:00"),
+            Some(0.125)
+        );
+        assert_eq!(
+            parse_program_date_time("1969-12-31T19:00:00-0500"),
+            Some(0.0)
+        );
+        assert!(parse_program_date_time("2023-02-29T00:00:00Z").is_none());
+        assert!(parse_program_date_time("2024-02-29T00:00:00").is_none());
+        assert_eq!(
+            parse_program_date_time("2024-03-01T00:00:00Z").unwrap()
+                - parse_program_date_time("2024-02-29T00:00:00Z").unwrap(),
+            86_400.0
+        );
+        let text = concat!(
+            "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n#EXT-X-DISCONTINUITY-SEQUENCE:8\n",
+            "#EXTINF:2,\nfirst.m4s\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:10Z\n",
+            "#EXTINF:3,\nsecond.m4s\n#EXTINF:4,\nthird.m4s\n",
+            "#EXT-X-DISCONTINUITY\n#EXTINF:4,\nfourth.m4s\n",
+        );
+        let HlsPlaylist::Media(p) =
+            parse_playlist(text, "https://example.invalid/live.m3u8").unwrap()
+        else {
+            panic!("expected a Media Playlist");
+        };
+        assert_eq!(
+            p.segments
+                .iter()
+                .map(|seg| (seg.discontinuity_sequence, seg.program_date_time))
+                .collect::<Vec<_>>(),
+            [(8, Some(8.0)), (8, Some(10.0)), (8, Some(13.0)), (9, None)]
+        );
+    }
 
     #[test]
     fn parses_master_variants() {

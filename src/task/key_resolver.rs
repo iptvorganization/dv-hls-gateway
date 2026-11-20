@@ -17,6 +17,7 @@ pub async fn resolve_key_store(
 ) -> crate::Result<KeyStore> {
     let kids = normalize_unique_kids(required_kids);
     match mode {
+        KeyMode::Clear => Ok(KeyStore::default()),
         KeyMode::Static => {
             let store = KeyStore::parse(static_keys);
             if store.is_empty() && !kids.is_empty() {

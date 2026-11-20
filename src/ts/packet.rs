@@ -5,6 +5,84 @@ use std::collections::HashMap;
 
 use super::{SYNC_BYTE, TS_PACKET_SIZE};
 
+/// Read the first video PES PTS in a TS segment without rewriting the stream.
+pub fn first_video_pts_90k(data: &[u8]) -> Option<u64> {
+    #[derive(Default)]
+    struct Header {
+        bytes: [u8; 14],
+        held: usize,
+        cc: u8,
+    }
+
+    // Adaptation fields can leave only a few header bytes in the first packet.
+    // Other PIDs may be interleaved before the remainder of this header.
+    let mut pending = HashMap::<u16, Header>::new();
+    for packet in data.chunks_exact(TS_PACKET_SIZE) {
+        if packet[0] != SYNC_BYTE {
+            continue;
+        }
+        let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+        if packet[1] & 0x80 != 0 || packet[3] & 0xc0 != 0 {
+            pending.remove(&pid);
+            continue;
+        }
+        let payload_start = match (packet[3] >> 4) & 3 {
+            1 => 4,
+            3 => 5 + usize::from(packet[4]),
+            _ => continue,
+        };
+        let Some(payload) = packet.get(payload_start..).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let cc = packet[3] & 0x0f;
+        let header = if packet[1] & 0x40 != 0 {
+            pending.remove(&pid);
+            Header {
+                cc,
+                ..Default::default()
+            }
+        } else {
+            let Some(mut header) = pending.remove(&pid) else {
+                continue;
+            };
+            if cc != ((header.cc + 1) & 0x0f) {
+                continue;
+            }
+            header.cc = cc;
+            header
+        };
+        let mut header = header;
+        let take = (header.bytes.len() - header.held).min(payload.len());
+        header.bytes[header.held..header.held + take].copy_from_slice(&payload[..take]);
+        header.held += take;
+        let prefix = header.held.min(3);
+        if header.bytes[..prefix] != [0, 0, 1][..prefix]
+            || (header.held >= 4 && !(0xe0..=0xef).contains(&header.bytes[3]))
+        {
+            continue;
+        }
+        if header.held < header.bytes.len() {
+            pending.insert(pid, header);
+            continue;
+        }
+        let h = header.bytes;
+        if h[6] & 0xc0 != 0x80 || h[7] & 0x80 == 0 || h[8] < 5 {
+            continue;
+        }
+        let [a, b, c, d, e] = [h[9], h[10], h[11], h[12], h[13]];
+        if (a & c & e & 1) != 0 {
+            return Some(
+                (u64::from(a & 0x0e) << 29)
+                    | (u64::from(b) << 22)
+                    | (u64::from(c & 0xfe) << 14)
+                    | (u64::from(d) << 7)
+                    | u64::from(e >> 1),
+            );
+        }
+    }
+    None
+}
+
 /// 每个 PID 独立的 continuity counter。
 #[derive(Default)]
 pub struct ContinuityCounters {
@@ -182,5 +260,47 @@ mod tests {
         let mut out = Vec::new();
         pack_pes(0x0101, &pes, None, false, &mut cc, &mut out);
         assert_eq!(out.len() % 188, 0);
+    }
+
+    #[test]
+    fn reads_video_presentation_timestamp_not_audio_or_decode_time() {
+        let mut cc = ContinuityCounters::new();
+        let mut out = Vec::new();
+        let audio = super::super::pes::build_pes(0xc0, 90_000, None, b"audio");
+        let video_pts = crate::clock::PTS_MODULO - 17;
+        let video = super::super::pes::build_pes(0xe0, video_pts, Some(video_pts - 123), b"video");
+        pack_pes(0x102, &audio, None, false, &mut cc, &mut out);
+        pack_pes(
+            0x101,
+            &video,
+            Some(video_pts - 200),
+            true,
+            &mut cc,
+            &mut out,
+        );
+        assert_eq!(first_video_pts_90k(&out), Some(video_pts));
+    }
+
+    #[test]
+    fn reads_header_split_across_interleaved_ts_packets() {
+        let video = super::super::pes::build_pes(0xe0, 135_000, None, b"video");
+        let mut first = [0xff; TS_PACKET_SIZE];
+        first[..6].copy_from_slice(&[SYNC_BYTE, 0x41, 0x01, 0x30, 181, 0]);
+        first[186..].copy_from_slice(&video[..2]);
+        let mut out = first.to_vec();
+        let audio = super::super::pes::build_pes(0xc0, 90_000, None, b"audio");
+        pack_pes(
+            0x102,
+            &audio,
+            None,
+            false,
+            &mut ContinuityCounters::new(),
+            &mut out,
+        );
+        let mut continuation = [0xff; TS_PACKET_SIZE];
+        continuation[..4].copy_from_slice(&[SYNC_BYTE, 0x01, 0x01, 0x11]);
+        continuation[4..4 + video.len() - 2].copy_from_slice(&video[2..]);
+        out.extend_from_slice(&continuation);
+        assert_eq!(first_video_pts_90k(&out), Some(135_000));
     }
 }

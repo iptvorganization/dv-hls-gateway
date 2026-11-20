@@ -3,7 +3,7 @@
 use super::bitwriter::BitWriter;
 
 /// 构造一个 PES packet（视频不定长，PES_packet_length=0）。
-/// - `stream_id`: 0xE0(video) / 0xC0(audio)
+/// - `stream_id`: 0xE0(video) / 0xC0(audio) / 0xBD(AC-4 private_stream_1)
 /// - `pts90`/`dts90`: 90kHz 时间戳；若 `dts90==None` 则只写 PTS。
 /// - `payload`: ES 数据（视频=Annex-B AU，音频=帧字节）。
 pub fn build_pes(stream_id: u8, pts90: u64, dts90: Option<u64>, payload: &[u8]) -> Vec<u8> {

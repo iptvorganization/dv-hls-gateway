@@ -1,9 +1,18 @@
-//! PMT 内的描述符。重点是 Dolby Vision 的 dolby_vision_video_descriptor (tag 0xB0)。
+//! PMT 内的 Dolby Vision 和 AC-4 描述符。
 
 use super::bitwriter::BitWriter;
 use crate::mp4::DoviConfig;
 
 pub const DOVI_DESCRIPTOR_TAG: u8 = 0xB0;
+
+/// DVB AC-4 descriptor (EN 300 468, Annex D, Table D.11): extension 0x15,
+/// with ac4_config_flag/ac4_toc_flag both zero. Put the legacy MPEG
+/// registration descriptor first for demuxers (e.g. FFmpeg 8.0) that recognize
+/// "AC-4" but not the DVB extension. It does not replace the DVB descriptor.
+pub const AC4_ES_DESCRIPTORS: [u8; 10] = [
+    0x05, 0x04, b'A', b'C', b'-', b'4', // registration_descriptor
+    0x7F, 0x02, 0x15, 0x00, // AC-4_descriptor
+];
 
 /// 构造 dolby_vision_video_descriptor（含 tag + length）。
 ///
